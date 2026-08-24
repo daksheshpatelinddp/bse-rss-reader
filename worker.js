@@ -1,5 +1,5 @@
 /*
- * BSE RSS Reader Worker - STEP 2
+ * BSE RSS Reader Worker - STEP 3
  *
  * Source:
  * https://beta.bseindia.com/Data/XML/FinancialResultsFeed.xml
@@ -23,6 +23,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -40,11 +41,12 @@ export default {
       });
     }
 
-    // Parsed BSE Financial Results
+    // BSE Financial Results
     if (url.pathname === "/bse-results") {
       return await getBseResults();
     }
 
+    // Unknown endpoint
     return json(
       {
         ok: false,
@@ -57,19 +59,23 @@ export default {
 
 
 // --------------------------------------------------
-// FETCH + PARSE BSE RSS
+// FETCH BSE RSS + RETURN PARSED JSON
 // --------------------------------------------------
 
 async function getBseResults() {
   try {
     const response = await fetch(BSE_FEED, {
       method: "GET",
+
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+
         "Accept":
           "application/rss+xml, application/xml, text/xml, */*",
-        "Referer": "https://www.bseindia.com/"
+
+        "Referer":
+          "https://www.bseindia.com/"
       }
     });
 
@@ -94,7 +100,7 @@ async function getBseResults() {
       feedUrl: BSE_FEED,
       fetchedAt: new Date().toISOString(),
       count: items.length,
-      items
+      items: items
     });
 
   } catch (error) {
@@ -117,9 +123,11 @@ async function getBseResults() {
 function parseItems(xml) {
   const items = [];
 
-  const itemMatches = xml.match(/<item\b[\s\S]*?<\/item>/gi) || [];
+  const itemMatches =
+    xml.match(/<item\b[\s\S]*?<\/item>/gi) || [];
 
   for (const itemXml of itemMatches) {
+
     const title = cleanXml(
       getTag(itemXml, "title")
     );
@@ -132,41 +140,49 @@ function parseItems(xml) {
       getTag(itemXml, "description")
     );
 
+    // Skip invalid entries
     if (!title && !link) {
       continue;
     }
 
     const company = parseCompany(title);
+
     const scrip = parseScrip(title);
 
-    const resultType = parseResultType(description);
-    const basis = parseBasis(description);
+    const resultType =
+      parseResultType(description);
 
-    const periodStart = parseField(
-      description,
-      "PERIOD START DATE"
-    );
+    const basis =
+      parseBasis(description);
 
-    const periodEnd = parseField(
-      description,
-      "PERIOD END DATE"
-    );
+    const periodStart =
+      parseField(
+        description,
+        "PERIOD START DATE"
+      );
 
-    const indAs = parseField(
-      description,
-      "IND AS/NON IND AS"
-    );
+    const periodEnd =
+      parseField(
+        description,
+        "PERIOD END DATE"
+      );
+
+    const indAs =
+      parseField(
+        description,
+        "IND AS/NON IND AS"
+      );
 
     items.push({
-      company,
-      scrip,
-      resultType,
-      basis,
-      periodStart,
-      periodEnd,
-      indAs,
-      title,
-      link
+      company: company,
+      scrip: scrip,
+      resultType: resultType,
+      basis: basis,
+      periodStart: periodStart,
+      periodEnd: periodEnd,
+      indAs: indAs,
+      title: title,
+      link: link
     });
   }
 
@@ -175,13 +191,17 @@ function parseItems(xml) {
 
 
 // --------------------------------------------------
-// COMPANY + SCRIP
+// COMPANY NAME
 // --------------------------------------------------
 
 function parseCompany(title) {
-  if (!title) return "";
 
-  const match = title.match(/^(.+?)\s*\(\d+\)\s*$/);
+  if (!title) {
+    return "";
+  }
+
+  const match =
+    title.match(/^(.+?)\s*\(\d+\)\s*$/);
 
   if (match) {
     return match[1].trim();
@@ -190,90 +210,188 @@ function parseCompany(title) {
   return title.trim();
 }
 
+
+// --------------------------------------------------
+// BSE SCRIP CODE
+// --------------------------------------------------
+
 function parseScrip(title) {
-  if (!title) return "";
 
-  const match = title.match(/\((\d+)\)\s*$/);
-
-  return match ? match[1] : "";
-}
-
-
-// --------------------------------------------------
-// DESCRIPTION FIELDS
-// --------------------------------------------------
-
-function parseResultType(description) {
-  if (!description) return "";
-
-  if (/audited/i.test(description)) {
-    return "Audited";
+  if (!title) {
+    return "";
   }
 
-  if (/unaudited/i.test(description)) {
-    return "Unaudited";
+  const match =
+    title.match(/\((\d+)\)\s*$/);
+
+  if (match) {
+    return match[1];
   }
 
   return "";
 }
 
-function parseBasis(description) {
-  if (!description) return "";
 
-  if (/standalone/i.test(description)) {
+// --------------------------------------------------
+// RESULT TYPE
+// --------------------------------------------------
+
+function parseResultType(description) {
+
+  if (!description) {
+    return "";
+  }
+
+  /*
+   * IMPORTANT:
+   *
+   * "audited" is contained inside
+   * "unaudited".
+   *
+   * Therefore Unaudited MUST be
+   * checked first.
+   */
+
+  if (/\bunaudited\b/i.test(description)) {
+    return "Unaudited";
+  }
+
+  if (/\baudited\b/i.test(description)) {
+    return "Audited";
+  }
+
+  return "";
+}
+
+
+// --------------------------------------------------
+// BASIS
+// --------------------------------------------------
+
+function parseBasis(description) {
+
+  if (!description) {
+    return "";
+  }
+
+  if (/\bstandalone\b/i.test(description)) {
     return "Standalone";
   }
 
-  if (/consolidated/i.test(description)) {
+  if (/\bconsolidated\b/i.test(description)) {
     return "Consolidated";
   }
 
   return "";
 }
 
+
+// --------------------------------------------------
+// DESCRIPTION FIELD PARSER
+// --------------------------------------------------
+
 function parseField(description, fieldName) {
-  if (!description) return "";
+
+  if (!description) {
+    return "";
+  }
+
+  const escapedField =
+    fieldName.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
+    );
 
   const regex = new RegExp(
-    fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+    escapedField +
       "\\s*:\\s*([^|<]+)",
     "i"
   );
 
-  const match = description.match(regex);
+  const match =
+    description.match(regex);
 
-  return match ? match[1].trim() : "";
+  if (match) {
+    return match[1].trim();
+  }
+
+  return "";
 }
 
 
 // --------------------------------------------------
-// XML HELPERS
+// XML TAG READER
 // --------------------------------------------------
 
 function getTag(xml, tag) {
+
   const regex = new RegExp(
-    "<" + tag + "\\b[^>]*>([\\s\\S]*?)<\\/" + tag + ">",
+    "<" +
+      tag +
+      "\\b[^>]*>([\\s\\S]*?)<\\/" +
+      tag +
+      ">",
     "i"
   );
 
-  const match = xml.match(regex);
+  const match =
+    xml.match(regex);
 
-  return match ? match[1].trim() : "";
+  if (match) {
+    return match[1].trim();
+  }
+
+  return "";
 }
 
+
+// --------------------------------------------------
+// CLEAN XML / HTML ENTITIES
+// --------------------------------------------------
+
 function cleanXml(value) {
-  if (!value) return "";
+
+  if (!value) {
+    return "";
+  }
 
   return value
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&#x27;/gi, "'")
-    .replace(/&nbsp;/gi, " ")
+    .replace(
+      /<!\[CDATA\[([\s\S]*?)\]\]>/g,
+      "$1"
+    )
+    .replace(
+      /<[^>]+>/g,
+      ""
+    )
+    .replace(
+      /&amp;/gi,
+      "&"
+    )
+    .replace(
+      /&lt;/gi,
+      "<"
+    )
+    .replace(
+      /&gt;/gi,
+      ">"
+    )
+    .replace(
+      /&quot;/gi,
+      '"'
+    )
+    .replace(
+      /&#39;/gi,
+      "'"
+    )
+    .replace(
+      /&#x27;/gi,
+      "'"
+    )
+    .replace(
+      /&nbsp;/gi,
+      " "
+    )
     .trim();
 }
 
@@ -283,13 +401,21 @@ function cleanXml(value) {
 // --------------------------------------------------
 
 function json(data, status = 200) {
+
   return new Response(
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     {
-      status,
+      status: status,
+
       headers: {
         ...CORS_HEADERS,
-        "Content-Type": "application/json; charset=utf-8"
+
+        "Content-Type":
+          "application/json; charset=utf-8"
       }
     }
   );
