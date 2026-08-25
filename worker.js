@@ -1,862 +1,335 @@
 /*
  * BSE RSS READER
+ * V2 - Financial Results + Corporate Announcements
  *
- * Background monitoring foundation
+ * Endpoints:
  *
- * Feeds:
- *   Financial Results
- *
- * API:
  *   /
  *   /bse-results
+ *   /bse-announcements
+ *   /feeds
  *   /watchlist
  *
- * Background:
- *   Cloudflare Cron - every minute
+ * Worker monitoring:
+ *   Every minute through Cloudflare Cron
  *
- * KV:
- *   BSE_DATA
+ * Feeds:
+ *   1. Financial Results
+ *   2. Corporate Announcements
+ *
+ * IMPORTANT:
+ * The reader shows ALL feed items.
+ * Watchlist is used for priority/alerts only.
  */
 
+// ============================================================
+// CONFIG
+// ============================================================
 
-const BSE_FINANCIAL_RESULTS =
+const FINANCIAL_RESULTS_URL =
   "https://beta.bseindia.com/Data/XML/FinancialResultsFeed.xml";
 
+const CORPORATE_ANNOUNCEMENTS_URL =
+  "https://beta.bseindia.com/data/xml/announcements.xml";
+
+
+// ============================================================
+// CORS
+// ============================================================
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods":
-    "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "*",
-  "Cache-Control": "no-store"
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
 };
 
 
-// ==================================================
-// MAIN REQUEST HANDLER
-// ==================================================
+// ============================================================
+// RESPONSE HELPERS
+// ============================================================
 
-export default {
+function json(data, status = 200) {
 
-  async fetch(request, env) {
-
-    const url =
-      new URL(request.url);
-
-
-    // ----------------------------------------------
-    // CORS
-    // ----------------------------------------------
-
-    if (request.method === "OPTIONS") {
-
-      return new Response(null, {
-        status: 204,
-        headers: CORS_HEADERS
-      });
-
-    }
-
-
-    // ----------------------------------------------
-    // HEALTH
-    // ----------------------------------------------
-
-    if (url.pathname === "/") {
-
-      return json({
-
-        ok: true,
-
-        app:
-          "BSE RSS Reader",
-
-        status:
-          "running",
-
-        feeds: [
-          "Financial Results"
-        ],
-
-        endpoints: [
-          "/bse-results",
-          "/watchlist"
-        ],
-
-        monitoring:
-          "Every minute"
-
-      });
-
-    }
-
-
-    // ----------------------------------------------
-    // BSE RESULTS
-    // ----------------------------------------------
-
-    if (
-      url.pathname === "/bse-results"
-    ) {
-
-      return await getBseResults();
-
-    }
-
-
-    // ----------------------------------------------
-    // WATCHLIST
-    // ----------------------------------------------
-
-    if (
-      url.pathname === "/watchlist"
-    ) {
-
-      return await handleWatchlist(
-        request,
-        env
-      );
-
-    }
-
-
-    // ----------------------------------------------
-    // NOT FOUND
-    // ----------------------------------------------
-
-    return json(
-      {
-        ok: false,
-        error: "Not found"
-      },
-      404
-    );
-
-  },
-
-
-  // =================================================
-  // CLOUDFLARE CRON
-  // =================================================
-
-  async scheduled(event, env, ctx) {
-
-    ctx.waitUntil(
-      monitorBseFeeds(env)
-    );
-
-  }
-
-};
-
-
-// ==================================================
-// FETCH BSE RESULTS
-// ==================================================
-
-async function getBseResults() {
-
-  try {
-
-    const response =
-      await fetch(
-        BSE_FINANCIAL_RESULTS,
-        {
-          method: "GET",
-
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-
-            "Accept":
-              "application/rss+xml, application/xml, text/xml, */*",
-
-            "Referer":
-              "https://www.bseindia.com/"
-          }
-        }
-      );
-
-
-    if (!response.ok) {
-
-      return json(
-        {
-          ok: false,
-          error:
-            "BSE feed request failed",
-          status:
-            response.status
-        },
-        502
-      );
-
-    }
-
-
-    const xml =
-      await response.text();
-
-
-    const items =
-      parseItems(xml);
-
-
-    return json({
-
-      ok: true,
-
-      source:
-        "BSE Financial Results RSS",
-
-      feedUrl:
-        BSE_FINANCIAL_RESULTS,
-
-      fetchedAt:
-        new Date().toISOString(),
-
-      count:
-        items.length,
-
-      items
-
-    });
-
-
-  } catch (error) {
-
-    return json(
-      {
-        ok: false,
-
-        error:
-          "Failed to fetch BSE RSS",
-
-        message:
-          error.message
-      },
-      502
-    );
-
-  }
-
-}
-
-
-// ==================================================
-// BACKGROUND MONITOR
-// ==================================================
-
-async function monitorBseFeeds(env) {
-
-  try {
-
-    console.log(
-      "BSE background check started"
-    );
-
-
-    // ----------------------------------------------
-    // Load whitelist
-    // ----------------------------------------------
-
-    const whitelist =
-      await getWatchlist(env);
-
-
-    if (
-      whitelist.length === 0
-    ) {
-
-      console.log(
-        "No companies in watchlist"
-      );
-
-      return;
-
-    }
-
-
-    // ----------------------------------------------
-    // Fetch current BSE feed
-    // ----------------------------------------------
-
-    const response =
-      await fetch(
-        BSE_FINANCIAL_RESULTS,
-        {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 BSE RSS Reader"
-          }
-        }
-      );
-
-
-    if (!response.ok) {
-
-      console.log(
-        "BSE feed failed:",
-        response.status
-      );
-
-      return;
-
-    }
-
-
-    const xml =
-      await response.text();
-
-
-    const items =
-      parseItems(xml);
-
-
-    console.log(
-      "BSE items:",
-      items.length
-    );
-
-
-    // ----------------------------------------------
-    // Load previously seen items
-    // ----------------------------------------------
-
-    let seen =
-      await env.BSE_DATA.get(
-        "seen_results",
-        "json"
-      );
-
-
-    if (!Array.isArray(seen)) {
-      seen = [];
-    }
-
-
-    // ----------------------------------------------
-    // Check each item
-    // ----------------------------------------------
-
-    const newWatchedItems = [];
-
-
-    for (const item of items) {
-
-      const itemId =
-        makeItemId(item);
-
-
-      // Already processed
-      if (
-        seen.includes(itemId)
-      ) {
-
-        continue;
-
-      }
-
-
-      // Mark as seen
-      seen.push(itemId);
-
-
-      // Is company watched?
-      const watched =
-        whitelist.some(
-          watch =>
-            String(watch.scrip) ===
-            String(item.scrip)
-        );
-
-
-      if (watched) {
-
-        newWatchedItems.push({
-          ...item,
-
-          detectedAt:
-            new Date().toISOString()
-        });
-
-      }
-
-    }
-
-
-    // ----------------------------------------------
-    // Keep only recent seen IDs
-    // ----------------------------------------------
-
-    if (seen.length > 1000) {
-
-      seen =
-        seen.slice(
-          seen.length - 1000
-        );
-
-    }
-
-
-    await env.BSE_DATA.put(
-      "seen_results",
-      JSON.stringify(seen)
-    );
-
-
-    // ----------------------------------------------
-    // Store new watched items
-    //
-    // Notification system will use this
-    // in the next step.
-    // ----------------------------------------------
-
-    if (
-      newWatchedItems.length > 0
-    ) {
-
-      let alerts =
-        await env.BSE_DATA.get(
-          "pending_alerts",
-          "json"
-        );
-
-
-      if (!Array.isArray(alerts)) {
-        alerts = [];
-      }
-
-
-      alerts.push(
-        ...newWatchedItems
-      );
-
-
-      // Keep last 200 alerts
-      if (alerts.length > 200) {
-
-        alerts =
-          alerts.slice(
-            alerts.length - 200
-          );
-
-      }
-
-
-      await env.BSE_DATA.put(
-        "pending_alerts",
-        JSON.stringify(alerts)
-      );
-
-
-      console.log(
-        "NEW WATCHED RESULTS:",
-        newWatchedItems.length
-      );
-
-    }
-
-
-    // ----------------------------------------------
-    // Save last monitoring time
-    // ----------------------------------------------
-
-    await env.BSE_DATA.put(
-      "last_check",
-      JSON.stringify({
-        checkedAt:
-          new Date().toISOString(),
-
-        feed:
-          "Financial Results",
-
-        itemCount:
-          items.length,
-
-        newWatchedItems:
-          newWatchedItems.length
-      })
-    );
-
-
-  } catch (error) {
-
-    console.log(
-      "Background monitor error:",
-      error.message
-    );
-
-  }
-
-}
-
-
-// ==================================================
-// WATCHLIST API
-// ==================================================
-
-async function handleWatchlist(
-  request,
-  env
-) {
-
-  // ----------------------------------------------
-  // GET
-  // ----------------------------------------------
-
-  if (
-    request.method === "GET"
-  ) {
-
-    const watchlist =
-      await getWatchlist(env);
-
-
-    return json({
-      ok: true,
-      count: watchlist.length,
-      watchlist
-    });
-
-  }
-
-
-  // ----------------------------------------------
-  // POST
-  // ----------------------------------------------
-
-  if (
-    request.method === "POST"
-  ) {
-
-    try {
-
-      const body =
-        await request.json();
-
-
-      const name =
-        String(
-          body.name || ""
-        ).trim();
-
-
-      const scrip =
-        String(
-          body.scrip || ""
-        ).trim();
-
-
-      if (
-        !name ||
-        !scrip
-      ) {
-
-        return json(
-          {
-            ok: false,
-            error:
-              "name and scrip are required"
-          },
-          400
-        );
-
-      }
-
-
-      let watchlist =
-        await getWatchlist(env);
-
-
-      const exists =
-        watchlist.some(
-          item =>
-            String(item.scrip) ===
-            scrip
-        );
-
-
-      if (!exists) {
-
-        watchlist.push({
-
-          name,
-
-          scrip,
-
-          addedAt:
-            new Date().toISOString()
-
-        });
-
-
-        await saveWatchlist(
-          env,
-          watchlist
-        );
-
-      }
-
-
-      return json({
-
-        ok: true,
-
-        watchlist,
-
-        added:
-          !exists
-
-      });
-
-
-    } catch (error) {
-
-      return json(
-        {
-          ok: false,
-          error:
-            "Invalid request"
-        },
-        400
-      );
-
-    }
-
-  }
-
-
-  // ----------------------------------------------
-  // DELETE
-  // ----------------------------------------------
-
-  if (
-    request.method === "DELETE"
-  ) {
-
-    const scrip =
-      new URL(request.url)
-        .searchParams
-        .get("scrip");
-
-
-    if (!scrip) {
-
-      return json(
-        {
-          ok: false,
-          error:
-            "scrip is required"
-        },
-        400
-      );
-
-    }
-
-
-    let watchlist =
-      await getWatchlist(env);
-
-
-    watchlist =
-      watchlist.filter(
-        item =>
-          String(item.scrip) !==
-          String(scrip)
-      );
-
-
-    await saveWatchlist(
-      env,
-      watchlist
-    );
-
-
-    return json({
-
-      ok: true,
-
-      watchlist
-
-    });
-
-  }
-
-
-  return json(
+  return new Response(
+    JSON.stringify(data, null, 2),
     {
-      ok: false,
-      error:
-        "Method not allowed"
-    },
-    405
+      status,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        ...CORS_HEADERS,
+      },
+    }
   );
 
 }
 
 
-// ==================================================
-// GET WATCHLIST
-// ==================================================
+// ============================================================
+// HTML CLEANING
+// ============================================================
 
-async function getWatchlist(env) {
+function decodeHtml(value) {
 
-  const watchlist =
-    await env.BSE_DATA.get(
-      "watchlist",
-      "json"
+  return String(value || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#039;/gi, "'")
+    .replace(/&#39;/gi, "'")
+    .replace(/&nbsp;/gi, " ");
+
+}
+
+
+function stripHtml(value) {
+
+  return decodeHtml(value)
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+}
+
+
+// ============================================================
+// XML HELPERS
+// ============================================================
+
+function xmlTag(xml, tag) {
+
+  const regex =
+    new RegExp(
+      `<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,
+      "i"
+    );
+
+  const match = xml.match(regex);
+
+  if (!match) {
+    return "";
+  }
+
+  return stripHtml(match[1]);
+
+}
+
+
+function xmlTagRaw(xml, tag) {
+
+  const regex =
+    new RegExp(
+      `<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,
+      "i"
+    );
+
+  const match = xml.match(regex);
+
+  return match ? match[1] : "";
+}
+
+
+// ============================================================
+// FETCH XML
+// ============================================================
+
+async function fetchXML(url) {
+
+  const response =
+    await fetch(
+      url,
+      {
+        method: "GET",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (compatible; BSE-RSS-Reader/2.0)",
+          "Accept":
+            "application/rss+xml, application/xml, text/xml, */*",
+          "Cache-Control":
+            "no-cache",
+        },
+        cf: {
+          cacheTtl: 0,
+          cacheEverything: false,
+        },
+      }
     );
 
 
-  if (
-    !Array.isArray(watchlist)
-  ) {
+  if (!response.ok) {
 
-    return [];
+    throw new Error(
+      `BSE feed HTTP ${response.status}`
+    );
 
   }
 
 
-  return watchlist;
+  return await response.text();
 
 }
 
 
-// ==================================================
-// SAVE WATCHLIST
-// ==================================================
+// ============================================================
+// FINANCIAL RESULTS PARSER
+// ============================================================
 
-async function saveWatchlist(
-  env,
-  watchlist
-) {
-
-  await env.BSE_DATA.put(
-    "watchlist",
-    JSON.stringify(watchlist)
-  );
-
-}
-
-
-// ==================================================
-// UNIQUE ITEM ID
-// ==================================================
-
-function makeItemId(item) {
-
-  return [
-    item.scrip,
-    item.resultType,
-    item.basis,
-    item.periodStart,
-    item.periodEnd,
-    item.link
-  ].join("|");
-
-}
-
-
-// ==================================================
-// PARSE RSS ITEMS
-// ==================================================
-
-function parseItems(xml) {
+function parseFinancialResults(xml) {
 
   const items = [];
 
-
-  const itemMatches =
+  const matches =
     xml.match(
-      /<item\b[\s\S]*?<\/item>/gi
+      /<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi
     ) || [];
 
 
-  for (
-    const itemXml
-    of itemMatches
-  ) {
+  for (const itemXML of matches) {
 
     const title =
-      cleanXml(
-        getTag(
-          itemXml,
-          "title"
-        )
-      );
-
+      xmlTag(itemXML, "title");
 
     const link =
-      cleanXml(
-        getTag(
-          itemXml,
-          "link"
-        )
-      );
-
+      xmlTag(itemXML, "link");
 
     const description =
-      cleanXml(
-        getTag(
-          itemXml,
-          "description"
-        )
+      xmlTag(itemXML, "description");
+
+
+    if (!title) {
+      continue;
+    }
+
+
+    /*
+     * Example:
+     *
+     * Newever Trade Wings Ltd (536644)
+     */
+
+    let company =
+      title;
+
+    let scrip =
+      "";
+
+
+    const titleMatch =
+      title.match(
+        /^(.*?)\s*\((\d+)\)\s*$/
       );
 
 
-    if (
-      !title &&
-      !link
-    ) {
+    if (titleMatch) {
 
-      continue;
+      company =
+        titleMatch[1].trim();
+
+      scrip =
+        titleMatch[2].trim();
 
     }
 
 
-    const company =
-      parseCompany(title);
+    const parts =
+      description
+        .split("|")
+        .map(x => x.trim())
+        .filter(Boolean);
 
 
-    const scrip =
-      parseScrip(title);
+    let resultType = "";
+    let basis = "";
+    let periodStart = "";
+    let periodEnd = "";
+    let indAs = "";
 
 
-    const resultType =
-      parseResultType(
-        description
-      );
+    for (const part of parts) {
+
+      const lower =
+        part.toLowerCase();
 
 
-    const basis =
-      parseBasis(
-        description
-      );
+      if (
+        lower === "audited" ||
+        lower === "unaudited"
+      ) {
+
+        resultType =
+          part;
+
+      }
 
 
-    const periodStart =
-      parseField(
-        description,
-        "PERIOD START DATE"
-      );
+      if (
+        lower === "standalone" ||
+        lower === "consolidated"
+      ) {
+
+        basis =
+          part;
+
+      }
 
 
-    const periodEnd =
-      parseField(
-        description,
-        "PERIOD END DATE"
-      );
+      if (
+        lower.includes(
+          "period start date"
+        )
+      ) {
+
+        periodStart =
+          part
+            .replace(
+              /period start date\s*:/i,
+              ""
+            )
+            .trim();
+
+      }
 
 
-    const indAs =
-      parseField(
-        description,
-        "IND AS/NON IND AS"
-      );
+      if (
+        lower.includes(
+          "period end date"
+        )
+      ) {
+
+        periodEnd =
+          part
+            .replace(
+              /period end date\s*:/i,
+              ""
+            )
+            .trim();
+
+      }
+
+
+      if (
+        lower.includes(
+          "ind as/non ind as"
+        )
+      ) {
+
+        indAs =
+          part
+            .replace(
+              /ind as\/non ind as\s*:/i,
+              ""
+            )
+            .trim();
+
+      }
+
+    }
 
 
     items.push({
+
+      feed:
+        "Financial Results",
 
       company,
 
@@ -874,7 +347,13 @@ function parseItems(xml) {
 
       title,
 
-      link
+      link,
+
+      description,
+
+      guid:
+        link ||
+        `${title}|${description}`,
 
     });
 
@@ -886,329 +365,937 @@ function parseItems(xml) {
 }
 
 
-// ==================================================
-// COMPANY
-// ==================================================
+// ============================================================
+// CORPORATE ANNOUNCEMENTS PARSER
+// ============================================================
 
-function parseCompany(title) {
+function parseCorporateAnnouncements(xml) {
 
-  if (!title) {
-    return "";
-  }
+  const items = [];
 
-
-  const match =
-    title.match(
-      /^(.+?)\s*\(\d+\)\s*$/
-    );
-
-
-  if (match) {
-
-    return match[1].trim();
-
-  }
-
-
-  return title.trim();
-
-}
-
-
-// ==================================================
-// SCRIP
-// ==================================================
-
-function parseScrip(title) {
-
-  if (!title) {
-    return "";
-  }
-
-
-  const match =
-    title.match(
-      /\((\d+)\)\s*$/
-    );
-
-
-  if (match) {
-
-    return match[1];
-
-  }
-
-
-  return "";
-
-}
-
-
-// ==================================================
-// RESULT TYPE
-// ==================================================
-
-function parseResultType(
-  description
-) {
-
-  if (!description) {
-    return "";
-  }
-
-
-  // IMPORTANT:
-  // Check Unaudited FIRST.
-
-  if (
-    /\bunaudited\b/i.test(
-      description
-    )
-  ) {
-
-    return "Unaudited";
-
-  }
-
-
-  if (
-    /\baudited\b/i.test(
-      description
-    )
-  ) {
-
-    return "Audited";
-
-  }
-
-
-  return "";
-
-}
-
-
-// ==================================================
-// BASIS
-// ==================================================
-
-function parseBasis(
-  description
-) {
-
-  if (!description) {
-    return "";
-  }
-
-
-  if (
-    /\bstandalone\b/i.test(
-      description
-    )
-  ) {
-
-    return "Standalone";
-
-  }
-
-
-  if (
-    /\bconsolidated\b/i.test(
-      description
-    )
-  ) {
-
-    return "Consolidated";
-
-  }
-
-
-  return "";
-
-}
-
-
-// ==================================================
-// DESCRIPTION FIELD
-// ==================================================
-
-function parseField(
-  description,
-  fieldName
-) {
-
-  if (!description) {
-    return "";
-  }
-
-
-  const escapedField =
-    fieldName.replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&"
-    );
-
-
-  const regex =
-    new RegExp(
-      escapedField +
-      "\\s*:\\s*([^|<]+)",
-      "i"
-    );
-
-
-  const match =
-    description.match(
-      regex
-    );
-
-
-  if (match) {
-
-    return match[1].trim();
-
-  }
-
-
-  return "";
-
-}
-
-
-// ==================================================
-// XML TAG
-// ==================================================
-
-function getTag(
-  xml,
-  tag
-) {
-
-  const regex =
-    new RegExp(
-      "<" +
-      tag +
-      "\\b[^>]*>([\\s\\S]*?)<\\/" +
-      tag +
-      ">",
-      "i"
-    );
-
-
-  const match =
+  const matches =
     xml.match(
-      regex
-    );
+      /<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi
+    ) || [];
 
 
-  if (match) {
+  for (const itemXML of matches) {
 
-    return match[1].trim();
+    const title =
+      xmlTag(itemXML, "title");
 
-  }
+    const link =
+      xmlTag(itemXML, "link");
 
+    const description =
+      xmlTag(itemXML, "description");
 
-  return "";
+    const pubDate =
+      xmlTag(itemXML, "pubDate");
 
-}
-
-
-// ==================================================
-// CLEAN XML
-// ==================================================
-
-function cleanXml(
-  value
-) {
-
-  if (!value) {
-    return "";
-  }
+    const guid =
+      xmlTag(itemXML, "guid");
 
 
-  return value
-
-    .replace(
-      /<!\[CDATA\[([\s\S]*?)\]\]>/g,
-      "$1"
-    )
-
-    .replace(
-      /<[^>]+>/g,
-      ""
-    )
-
-    .replace(
-      /&amp;/gi,
-      "&"
-    )
-
-    .replace(
-      /&lt;/gi,
-      "<"
-    )
-
-    .replace(
-      /&gt;/gi,
-      ">"
-    )
-
-    .replace(
-      /&quot;/gi,
-      '"'
-    )
-
-    .replace(
-      /&#39;/gi,
-      "'"
-    )
-
-    .replace(
-      /&#x27;/gi,
-      "'"
-    )
-
-    .replace(
-      /&nbsp;/gi,
-      " "
-    )
-
-    .trim();
-
-}
+    if (
+      !title &&
+      !description
+    ) {
+      continue;
+    }
 
 
-// ==================================================
-// JSON RESPONSE
-// ==================================================
+    /*
+     * BSE announcement titles can contain
+     * company name and scrip code in different
+     * formats.
+     *
+     * We therefore try several patterns.
+     */
 
-function json(
-  data,
-  status = 200
-) {
+    let company = "";
+    let scrip = "";
 
-  return new Response(
 
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
+    const titleMatch =
+      title.match(
+        /^(.*?)\s*\((\d{6})\)/
+      );
 
-    {
 
-      status,
+    if (titleMatch) {
 
-      headers: {
+      company =
+        titleMatch[1]
+          .trim();
 
-        ...CORS_HEADERS,
+      scrip =
+        titleMatch[2]
+          .trim();
 
-        "Content-Type":
-          "application/json; charset=utf-8"
+    }
+
+
+    /*
+     * Look for a 6 digit BSE scrip anywhere
+     * in title or description.
+     */
+
+    if (!scrip) {
+
+      const scripMatch =
+        `${title} ${description}`
+          .match(
+            /\b(\d{6})\b/
+          );
+
+
+      if (scripMatch) {
+
+        scrip =
+          scripMatch[1];
 
       }
 
     }
 
+
+    /*
+     * If company was not found from the title,
+     * try common labels.
+     */
+
+    if (!company) {
+
+      const companyMatch =
+        description.match(
+          /(?:company|security|scrip name)\s*[:\-]\s*([^|,<]+)/i
+        );
+
+
+      if (companyMatch) {
+
+        company =
+          companyMatch[1]
+            .trim();
+
+      }
+
+    }
+
+
+    /*
+     * Keep the complete announcement.
+     */
+
+    items.push({
+
+      feed:
+        "Corporate Announcements",
+
+      company,
+
+      scrip,
+
+      resultType:
+        "",
+
+      basis:
+        "",
+
+      periodStart:
+        "",
+
+      periodEnd:
+        "",
+
+      indAs:
+        "",
+
+      title,
+
+      link,
+
+      description,
+
+      pubDate,
+
+      guid:
+        guid ||
+        link ||
+        `${title}|${description}`,
+
+    });
+
+  }
+
+
+  return items;
+
+}
+
+
+// ============================================================
+// FEED FETCHERS
+// ============================================================
+
+async function fetchFinancialResults() {
+
+  const xml =
+    await fetchXML(
+      FINANCIAL_RESULTS_URL
+    );
+
+
+  const items =
+    parseFinancialResults(xml);
+
+
+  return {
+
+    feed:
+      "Financial Results",
+
+    feedUrl:
+      FINANCIAL_RESULTS_URL,
+
+    count:
+      items.length,
+
+    items,
+
+  };
+
+}
+
+
+// ------------------------------------------------------------
+
+async function fetchCorporateAnnouncements() {
+
+  const xml =
+    await fetchXML(
+      CORPORATE_ANNOUNCEMENTS_URL
+    );
+
+
+  const items =
+    parseCorporateAnnouncements(xml);
+
+
+  return {
+
+    feed:
+      "Corporate Announcements",
+
+    feedUrl:
+      CORPORATE_ANNOUNCEMENTS_URL,
+
+    count:
+      items.length,
+
+    items,
+
+  };
+
+}
+
+
+// ============================================================
+// WATCHLIST
+// ============================================================
+
+async function getWatchlist(env) {
+
+  if (!env.BSE_KV) {
+    return [];
+  }
+
+
+  const data =
+    await env.BSE_KV.get(
+      "watchlist",
+      "json"
+    );
+
+
+  return Array.isArray(data)
+    ? data
+    : [];
+
+}
+
+
+// ============================================================
+// SET WATCHLIST
+// ============================================================
+
+async function setWatchlist(
+  env,
+  watchlist
+) {
+
+  if (!env.BSE_KV) {
+
+    throw new Error(
+      "BSE_KV KV namespace is not configured."
+    );
+
+  }
+
+
+  await env.BSE_KV.put(
+    "watchlist",
+    JSON.stringify(
+      watchlist
+    )
   );
 
 }
+
+
+// ============================================================
+// WATCHLIST MATCH
+// ============================================================
+
+function matchesWatchlist(
+  item,
+  watchlist
+) {
+
+  if (
+    !Array.isArray(watchlist) ||
+    watchlist.length === 0
+  ) {
+
+    return false;
+
+  }
+
+
+  return watchlist.some(
+    watch => {
+
+      if (
+        watch.scrip &&
+        item.scrip &&
+        String(watch.scrip) ===
+        String(item.scrip)
+      ) {
+
+        return true;
+
+      }
+
+
+      if (
+        watch.name &&
+        item.company
+      ) {
+
+        return (
+          String(watch.name)
+            .toLowerCase()
+            ===
+          String(item.company)
+            .toLowerCase()
+        );
+
+      }
+
+
+      return false;
+
+    }
+  );
+
+}
+
+
+// ============================================================
+// COMBINE FEEDS
+// ============================================================
+
+async function getAllFeeds() {
+
+  const results =
+    await Promise.allSettled([
+      fetchFinancialResults(),
+      fetchCorporateAnnouncements(),
+    ]);
+
+
+  const feeds = [];
+
+  const errors = [];
+
+
+  for (const result of results) {
+
+    if (
+      result.status ===
+      "fulfilled"
+    ) {
+
+      feeds.push(
+        result.value
+      );
+
+    } else {
+
+      errors.push(
+        String(
+          result.reason?.message ||
+          result.reason
+        )
+      );
+
+    }
+
+  }
+
+
+  return {
+    feeds,
+    errors,
+  };
+
+}
+
+
+// ============================================================
+// /bse-results
+// ============================================================
+
+async function handleFinancialResults() {
+
+  try {
+
+    const result =
+      await fetchFinancialResults();
+
+
+    return json({
+
+      ok: true,
+
+      source:
+        "BSE Financial Results RSS",
+
+      feedUrl:
+        FINANCIAL_RESULTS_URL,
+
+      fetchedAt:
+        new Date().toISOString(),
+
+      count:
+        result.items.length,
+
+      items:
+        result.items,
+
+    });
+
+  } catch (error) {
+
+    return json({
+
+      ok: false,
+
+      source:
+        "BSE Financial Results RSS",
+
+      error:
+        error.message,
+
+    }, 502);
+
+  }
+
+}
+
+
+// ============================================================
+// /bse-announcements
+// ============================================================
+
+async function handleAnnouncements() {
+
+  try {
+
+    const result =
+      await fetchCorporateAnnouncements();
+
+
+    return json({
+
+      ok: true,
+
+      source:
+        "BSE Corporate Announcements RSS",
+
+      feedUrl:
+        CORPORATE_ANNOUNCEMENTS_URL,
+
+      fetchedAt:
+        new Date().toISOString(),
+
+      count:
+        result.items.length,
+
+      items:
+        result.items,
+
+    });
+
+  } catch (error) {
+
+    return json({
+
+      ok: false,
+
+      source:
+        "BSE Corporate Announcements RSS",
+
+      error:
+        error.message,
+
+    }, 502);
+
+  }
+
+}
+
+
+// ============================================================
+// /feeds
+// ============================================================
+
+async function handleFeeds() {
+
+  const result =
+    await getAllFeeds();
+
+
+  const allItems =
+    result.feeds.flatMap(
+      feed =>
+        feed.items
+    );
+
+
+  return json({
+
+    ok:
+      result.errors.length === 0,
+
+    fetchedAt:
+      new Date().toISOString(),
+
+    feeds:
+      result.feeds.map(
+        feed => ({
+
+          feed:
+            feed.feed,
+
+          feedUrl:
+            feed.feedUrl,
+
+          count:
+            feed.count,
+
+        })
+      ),
+
+    errors:
+      result.errors,
+
+    count:
+      allItems.length,
+
+    items:
+      allItems,
+
+  });
+
+}
+
+
+// ============================================================
+// /watchlist GET
+// ============================================================
+
+async function handleWatchlistGet(env) {
+
+  const watchlist =
+    await getWatchlist(env);
+
+
+  return json({
+
+    ok: true,
+
+    count:
+      watchlist.length,
+
+    watchlist,
+
+  });
+
+}
+
+
+// ============================================================
+// /watchlist POST
+// ============================================================
+
+async function handleWatchlistPost(
+  request,
+  env
+) {
+
+  let body;
+
+
+  try {
+
+    body =
+      await request.json();
+
+  } catch {
+
+    return json({
+
+      ok: false,
+
+      error:
+        "Invalid JSON body.",
+
+    }, 400);
+
+  }
+
+
+  const watchlist =
+    Array.isArray(body.watchlist)
+      ? body.watchlist
+      : null;
+
+
+  if (!watchlist) {
+
+    return json({
+
+      ok: false,
+
+      error:
+        "watchlist must be an array.",
+
+    }, 400);
+
+  }
+
+
+  await setWatchlist(
+    env,
+    watchlist
+  );
+
+
+  return json({
+
+    ok: true,
+
+    count:
+      watchlist.length,
+
+    watchlist,
+
+  });
+
+}
+
+
+// ============================================================
+// ROOT
+// ============================================================
+
+async function handleRoot(env) {
+
+  const watchlist =
+    await getWatchlist(env);
+
+
+  return json({
+
+    ok: true,
+
+    app:
+      "BSE RSS Reader",
+
+    status:
+      "running",
+
+    feeds: [
+
+      "Financial Results",
+
+      "Corporate Announcements",
+
+    ],
+
+    endpoints: [
+
+      "/bse-results",
+
+      "/bse-announcements",
+
+      "/feeds",
+
+      "/watchlist",
+
+    ],
+
+    monitoring:
+      "Every minute",
+
+    watchlistCount:
+      watchlist.length,
+
+  });
+
+}
+
+
+// ============================================================
+// MONITORING
+// ============================================================
+
+async function monitorFeeds(env) {
+
+  const result =
+    await getAllFeeds();
+
+
+  const watchlist =
+    await getWatchlist(env);
+
+
+  const watchedItems = [];
+
+
+  for (
+    const feed of result.feeds
+  ) {
+
+    for (
+      const item of feed.items
+    ) {
+
+      if (
+        matchesWatchlist(
+          item,
+          watchlist
+        )
+      ) {
+
+        watchedItems.push(
+          item
+        );
+
+      }
+
+    }
+
+  }
+
+
+  /*
+   * Store latest watched items.
+   *
+   * This is deliberately separate from
+   * the normal feed data.
+   */
+
+  if (env.BSE_KV) {
+
+    await env.BSE_KV.put(
+
+      "latestWatched",
+
+      JSON.stringify({
+
+        checkedAt:
+          new Date().toISOString(),
+
+        count:
+          watchedItems.length,
+
+        items:
+          watchedItems,
+
+      })
+
+    );
+
+  }
+
+
+  return {
+
+    feeds:
+      result.feeds.length,
+
+    items:
+      result.feeds.reduce(
+        (total, feed) =>
+          total + feed.items.length,
+        0
+      ),
+
+    watched:
+      watchedItems.length,
+
+    errors:
+      result.errors,
+
+  };
+
+}
+
+
+// ============================================================
+// FETCH HANDLER
+// ============================================================
+
+export default {
+
+  async fetch(
+    request,
+    env,
+    ctx
+  ) {
+
+    const url =
+      new URL(
+        request.url
+      );
+
+
+    if (
+      request.method ===
+      "OPTIONS"
+    ) {
+
+      return new Response(
+        null,
+        {
+          headers:
+            CORS_HEADERS,
+        }
+      );
+
+    }
+
+
+    if (
+      url.pathname ===
+      "/"
+    ) {
+
+      return handleRoot(
+        env
+      );
+
+    }
+
+
+    if (
+      url.pathname ===
+      "/bse-results"
+    ) {
+
+      return handleFinancialResults();
+
+    }
+
+
+    if (
+      url.pathname ===
+      "/bse-announcements"
+    ) {
+
+      return handleAnnouncements();
+
+    }
+
+
+    if (
+      url.pathname ===
+      "/feeds"
+    ) {
+
+      return handleFeeds();
+
+    }
+
+
+    if (
+      url.pathname ===
+      "/watchlist" &&
+      request.method === "GET"
+    ) {
+
+      return handleWatchlistGet(
+        env
+      );
+
+    }
+
+
+    if (
+      url.pathname ===
+      "/watchlist" &&
+      request.method === "POST"
+    ) {
+
+      return handleWatchlistPost(
+        request,
+        env
+      );
+
+    }
+
+
+    return json({
+
+      ok: false,
+
+      error:
+        "Endpoint not found.",
+
+    }, 404);
+
+  },
+
+
+  // ==========================================================
+  // CRON
+  // ==========================================================
+
+  async scheduled(
+    event,
+    env,
+    ctx
+  ) {
+
+    ctx.waitUntil(
+
+      monitorFeeds(env)
+
+    );
+
+  },
+
+};
