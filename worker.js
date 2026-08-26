@@ -1,18 +1,37 @@
 /*
  * BSE RSS READER
- * V4 - Improved BSE Corporate Announcement Categories
- *       + Watchlist Alerts / Special Bundle
+ * V3 - Corporate Announcements + Categories + Alerts
  *
- * Main source:
+ * Main feed:
  *   BSE Corporate Announcements RSS
  *
- * Important:
- *   ALL announcements remain available.
- *   Categories are derived from BSE title/description.
+ * Secondary feed:
+ *   BSE Financial Results RSS
  *
- * KV binding:
+ * Features:
+ *   - Shows ALL BSE announcements
+ *   - Category classification
+ *   - BSE scrip whitelist
+ *   - Duplicate detection
+ *   - New whitelist announcement alerts
+ *   - Cloudflare KV alert storage
+ *   - Automatic alert expiry
+ *   - One-minute monitoring
+ *
+ * KV binding required:
+ *
  *   BSE_KV
+ *
+ * Cron:
+ *
+ *   * * * * *
+ *
  */
+
+
+/* ============================================================
+   CONFIG
+   ============================================================ */
 
 const FINANCIAL_RESULTS_URL =
   "https://beta.bseindia.com/Data/XML/FinancialResultsFeed.xml";
@@ -20,28 +39,96 @@ const FINANCIAL_RESULTS_URL =
 const CORPORATE_ANNOUNCEMENTS_URL =
   "https://beta.bseindia.com/data/xml/announcements.xml";
 
-const MAX_SEEN = 10000;
-const MAX_ALERTS = 1000;
+
+/*
+ * Alert retention.
+ *
+ * Current setting:
+ * 5 days.
+ *
+ * Later we can make this configurable
+ * from the frontend.
+ */
+const ALERT_TTL_SECONDS =
+  5 * 24 * 60 * 60;
+
+
+/*
+ * Remember fingerprints for 10 days.
+ *
+ * This prevents the same BSE announcement
+ * from repeatedly generating alerts.
+ */
+const DUPLICATE_TTL_SECONDS =
+  10 * 24 * 60 * 60;
+
+
+/*
+ * Maximum number of alert IDs kept
+ * in the alert index.
+ */
+const MAX_ALERTS =
+  500;
+
+
+/*
+ * KV keys.
+ */
+const WATCHLIST_KEY =
+  "watchlist";
+
+const ALERT_INDEX_KEY =
+  "alerts:index";
+
+const MONITOR_STATE_KEY =
+  "monitor:state";
+
+const LATEST_WATCHED_KEY =
+  "latestWatched";
+
+
+/* ============================================================
+   CORS
+   ============================================================ */
 
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+
+  "Access-Control-Allow-Origin":
+    "*",
+
+  "Access-Control-Allow-Methods":
+    "GET, POST, OPTIONS",
+
+  "Access-Control-Allow-Headers":
+    "Content-Type",
+
 };
 
 
 /* ============================================================
-   RESPONSE
+   JSON RESPONSE
    ============================================================ */
 
-function json(data, status = 200) {
+function json(
+  data,
+  status = 200
+) {
+
   return new Response(
-    JSON.stringify(data, null, 2),
+
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
+
     {
       status,
+
       headers: {
         "Content-Type":
           "application/json; charset=utf-8",
+
         ...CORS_HEADERS,
       },
     }
@@ -50,39 +137,179 @@ function json(data, status = 200) {
 
 
 /* ============================================================
-   XML / HTML HELPERS
+   HTML CLEANING
    ============================================================ */
 
-function decodeHtml(value) {
-  return String(value || "")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#039;/gi, "'")
-    .replace(/&#39;/gi, "'")
-    .replace(/&nbsp;/gi, " ");
+function decodeHtml(
+  value
+) {
+
+  return String(
+    value || ""
+  )
+
+    .replace(
+      /&amp;/gi,
+      "&"
+    )
+
+    .replace(
+      /&lt;/gi,
+      "<"
+    )
+
+    .replace(
+      /&gt;/gi,
+      ">"
+    )
+
+    .replace(
+      /&quot;/gi,
+      '"'
+    )
+
+    .replace(
+      /&#039;/gi,
+      "'"
+    )
+
+    .replace(
+      /&#39;/gi,
+      "'"
+    )
+
+    .replace(
+      /&nbsp;/gi,
+      " "
+
+    );
 }
 
 
-function stripHtml(value) {
-  return decodeHtml(value)
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
+function stripHtml(
+  value
+) {
+
+  return decodeHtml(
+    value
+  )
+
+    .replace(
+      /<[^>]*>/g,
+      " "
+    )
+
+    .replace(
+      /\s+/g,
+      " "
+    )
+
     .trim();
 }
 
 
-function xmlTag(xml, tag) {
-  const regex = new RegExp(
-    `<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,
-    "i"
-  );
+/* ============================================================
+   NORMALIZE TEXT
+   ============================================================ */
 
-  const match = xml.match(regex);
+function normalizeText(
+  value
+) {
+
+  return String(
+    value || ""
+  )
+
+    .toLowerCase()
+
+    .replace(
+      /<[^>]*>/g,
+      " "
+    )
+
+    .replace(
+      /&amp;/g,
+      "&"
+    )
+
+    .replace(
+      /[“”‘’]/g,
+      "'"
+    )
+
+    .replace(
+      /[–—]/g,
+      "-"
+    )
+
+    .replace(
+      /[^\w\s.-]/g,
+      " "
+    )
+
+    .replace(
+      /\s+/g,
+      " "
+    )
+
+    .trim();
+}
+
+
+/* ============================================================
+   XML HELPERS
+   ============================================================ */
+
+function xmlTag(
+  xml,
+  tag
+) {
+
+  const regex =
+    new RegExp(
+      `<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,
+      "i"
+    );
+
+
+  const match =
+    xml.match(
+      regex
+    );
+
+
+  if (!match) {
+
+    return "";
+  }
+
+
+  return stripHtml(
+    match[1]
+  );
+}
+
+
+function xmlTagRaw(
+  xml,
+  tag
+) {
+
+  const regex =
+    new RegExp(
+      `<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,
+      "i"
+    );
+
+
+  const match =
+    xml.match(
+      regex
+    );
+
 
   return match
-    ? stripHtml(match[1])
+    ? match[1]
     : "";
 }
 
@@ -91,29 +318,49 @@ function xmlTag(xml, tag) {
    FETCH BSE XML
    ============================================================ */
 
-async function fetchXML(url) {
-  const response = await fetch(url, {
-    method: "GET",
+async function fetchXML(
+  url
+) {
 
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (compatible; BSE-RSS-Reader/4.0)",
+  const response =
+    await fetch(
+      url,
+      {
 
-      "Accept":
-        "application/rss+xml, application/xml, text/xml, */*",
+        method:
+          "GET",
 
-      "Cache-Control":
-        "no-cache",
-    },
+        headers: {
 
-    cf: {
-      cacheTtl: 0,
-      cacheEverything: false,
-    },
-  });
+          "User-Agent":
+            "Mozilla/5.0 (compatible; BSE-RSS-Reader/3.0)",
+
+          "Accept":
+            "application/rss+xml, application/xml, text/xml, */*",
+
+          "Cache-Control":
+            "no-cache",
+
+        },
+
+        cf: {
+
+          cacheTtl:
+            0,
+
+          cacheEverything:
+            false,
+
+        },
+
+      }
+    );
 
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
+
     throw new Error(
       `BSE feed HTTP ${response.status}`
     );
@@ -125,612 +372,7 @@ async function fetchXML(url) {
 
 
 /* ============================================================
-   CATEGORY DEFINITIONS
-   ============================================================ */
-
-/*
- * IMPORTANT:
- *
- * Financial Results is intentionally STRICT.
- *
- * We do NOT use generic phrases such as:
- *
- *   financial statement
- *   annual report
- *   audited financial
- *
- * because those create false Financial Result matches.
- */
-
-const CATEGORY_RULES = [
-
-  /* ----------------------------------------------------------
-     FINANCIAL RESULTS
-     ---------------------------------------------------------- */
-
-  {
-    name: "Financial Results",
-
-    words: [
-      "financial results",
-      "financial result",
-      "unaudited financial results",
-      "audited financial results",
-      "quarterly results",
-      "quarterly result",
-      "results for the quarter",
-      "result for the quarter",
-      "results for the period",
-      "result for the period",
-      "standalone financial results",
-      "consolidated financial results",
-      "standalone results",
-      "consolidated results",
-      "results approved",
-      "results declared",
-      "financial results for the quarter",
-      "financial results for the period",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     BOARD MEETING
-     ---------------------------------------------------------- */
-
-  {
-    name: "Board Meeting",
-
-    words: [
-      "board meeting",
-      "meeting of the board",
-      "meeting of board of directors",
-      "board of directors meeting",
-      "board of director meeting",
-      "meeting of the board of directors",
-      "outcome of board meeting",
-      "outcome of the board meeting",
-      "scheduled meeting of board",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     DIVIDEND
-     ---------------------------------------------------------- */
-
-  {
-    name: "Dividend",
-
-    words: [
-      "dividend",
-      "interim dividend",
-      "final dividend",
-      "special dividend",
-      "dividend declared",
-      "dividend recommended",
-      "recommendation of dividend",
-      "declaration of dividend",
-      "payment of dividend",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     BONUS
-     ---------------------------------------------------------- */
-
-  {
-    name: "Bonus",
-
-    words: [
-      "bonus issue",
-      "bonus shares",
-      "issue of bonus shares",
-      "bonus equity shares",
-      "bonus issue of shares",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     RIGHTS ISSUE
-     ---------------------------------------------------------- */
-
-  {
-    name: "Rights Issue",
-
-    words: [
-      "rights issue",
-      "rights shares",
-      "rights entitlement",
-      "issue of equity shares on rights basis",
-      "rights basis",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     BUYBACK
-     ---------------------------------------------------------- */
-
-  {
-    name: "Buyback",
-
-    words: [
-      "buyback",
-      "buy back",
-      "buy-back",
-      "buyback of shares",
-      "buy-back of shares",
-      "repurchase of shares",
-      "repurchase of equity shares",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     FUND RAISING
-     ---------------------------------------------------------- */
-
-  {
-    name: "Fund Raising",
-
-    words: [
-      "fund raising",
-      "fundraising",
-      "fund raise",
-      "funds raised",
-      "fund raising programme",
-      "qualified institutional placement",
-      "qip",
-      "private placement",
-      "issue of securities",
-      "issue of equity shares",
-      "issue of debt securities",
-      "debt issue",
-      "raising of funds",
-      "raising funds",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     PREFERENTIAL ISSUE
-     ---------------------------------------------------------- */
-
-  {
-    name: "Preferential Issue",
-
-    words: [
-      "preferential issue",
-      "preferential allotment",
-      "preferential basis",
-      "issue on preferential basis",
-      "allotment on preferential basis",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     ALLOTMENT
-     ---------------------------------------------------------- */
-
-  {
-    name: "Allotment",
-
-    words: [
-      "allotment",
-      "allotment of shares",
-      "allotment of equity shares",
-      "allotment of securities",
-      "shares allotted",
-      "securities allotted",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     ACQUISITION
-     ---------------------------------------------------------- */
-
-  {
-    name: "Acquisition",
-
-    words: [
-      "acquisition",
-      "acquire",
-      "acquired",
-      "acquiring",
-      "takeover",
-      "take over",
-      "business acquisition",
-      "acquisition of shares",
-      "acquisition of stake",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     MERGER / AMALGAMATION
-     ---------------------------------------------------------- */
-
-  {
-    name: "Merger / Amalgamation",
-
-    words: [
-      "merger",
-      "amalgamation",
-      "scheme of arrangement",
-      "scheme of amalgamation",
-      "demerger",
-      "slump sale",
-      "scheme of merger",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     ORDER / CONTRACT
-     ---------------------------------------------------------- */
-
-  {
-    name: "Order / Contract",
-
-    words: [
-      "order received",
-      "order win",
-      "order won",
-      "order book",
-      "work order",
-      "contract received",
-      "contract awarded",
-      "letter of award",
-      "purchase order",
-      "received an order",
-      "received order",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     CREDIT RATING
-     ---------------------------------------------------------- */
-
-  {
-    name: "Credit Rating",
-
-    words: [
-      "credit rating",
-      "rating reaffirmed",
-      "rating reaffirmation",
-      "rating upgrade",
-      "rating downgrade",
-      "rating assigned",
-      "rating upgraded",
-      "rating downgraded",
-      "credit ratings",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     APPOINTMENT / RESIGNATION
-     ---------------------------------------------------------- */
-
-  {
-    name: "Appointment / Resignation",
-
-    words: [
-      "appointment",
-      "appointed as",
-      "appointment of",
-      "resignation",
-      "resigned",
-      "cessation",
-      "retirement of",
-      "director appointed",
-      "director resigned",
-      "change in director",
-      "change in management",
-      "key managerial personnel",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     SHAREHOLDING
-     ---------------------------------------------------------- */
-
-  {
-    name: "Shareholding",
-
-    words: [
-      "shareholding",
-      "shareholding pattern",
-      "shareholding disclosure",
-      "promoter holding",
-      "promoter group",
-      "substantial acquisition",
-      "substantial shareholding",
-      "shareholding of promoter",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     TRADING / INSIDER
-     ---------------------------------------------------------- */
-
-  {
-    name: "Trading / Insider",
-
-    words: [
-      "trading window",
-      "trading plan",
-      "insider trading",
-      "code of conduct",
-      "designated persons",
-      "closure of trading window",
-      "reopening of trading window",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     INVESTOR / ANALYST MEET
-     ---------------------------------------------------------- */
-
-  {
-    name: "Investor / Analyst Meet",
-
-    words: [
-      "investor meet",
-      "investors meet",
-      "analyst meet",
-      "analysts meet",
-      "investor call",
-      "investor conference",
-      "earnings call",
-      "conference call",
-      "investor presentation",
-      "analyst presentation",
-      "investor interaction",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     AGM / EGM
-     ---------------------------------------------------------- */
-
-  {
-    name: "AGM / EGM",
-
-    words: [
-      "annual general meeting",
-      "agm",
-      "extraordinary general meeting",
-      "egm",
-      "postal ballot",
-      "notice of agm",
-      "notice of the agm",
-      "notice of egm",
-      "convening of agm",
-      "convening of egm",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     ANNUAL REPORT
-     ---------------------------------------------------------- */
-
-  {
-    name: "Annual Report",
-
-    words: [
-      "annual report",
-      "annual reports",
-      "annual report for the financial year",
-      "annual report for fy",
-      "web-link for accessing the annual report",
-      "web link for accessing the annual report",
-      "dispatch of annual report",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     NEWSPAPER ADVERTISEMENT
-     ---------------------------------------------------------- */
-
-  {
-    name: "Newspaper Advertisement",
-
-    words: [
-      "newspaper advertisement",
-      "newspaper publication",
-      "advertisement published",
-      "publication of advertisement",
-      "publication in newspapers",
-      "newspaper notice",
-      "special window for relodgement",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     SHAREHOLDER COMMUNICATION
-     ---------------------------------------------------------- */
-
-  {
-    name: "Shareholder Communication",
-
-    words: [
-      "letter to shareholders",
-      "communication to shareholders",
-      "shareholders",
-      "shareholder communication",
-      "dispatch to shareholders",
-      "notice to shareholders",
-      "intimation to shareholders",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     CORPORATE ACTION
-     ---------------------------------------------------------- */
-
-  {
-    name: "Corporate Action",
-
-    words: [
-      "corporate action",
-      "record date",
-      "book closure",
-      "stock split",
-      "split of shares",
-      "sub-division",
-      "sub division",
-      "consolidation of shares",
-      "face value",
-      "change in face value",
-      "rights entitlement",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     REGULATION 30 / REGULATORY
-     ---------------------------------------------------------- */
-
-  {
-    name: "Regulatory / Legal",
-
-    words: [
-      "regulation 30",
-      "regulation 30 of sebi",
-      "regulation 30 of the sebi",
-      "sebi lodr",
-      "sebi (lodr)",
-      "securities and exchange board",
-      "regulatory disclosure",
-      "regulatory requirement",
-      "legal proceedings",
-      "court order",
-      "nclt",
-      "penalty",
-      "fine imposed",
-      "sebi",
-    ],
-  },
-
-
-  /* ----------------------------------------------------------
-     PRESS RELEASE
-     ---------------------------------------------------------- */
-
-  {
-    name: "Press Release",
-
-    words: [
-      "press release",
-      "media release",
-      "press note",
-      "press announcement",
-    ],
-  },
-];
-
-
-/* ============================================================
-   CLASSIFICATION
-   ============================================================ */
-
-function classifyAnnouncement(
-  title,
-  description
-) {
-
-  const text =
-    `${title || ""} ${description || ""}`
-      .toLowerCase()
-      .replace(/\s+/g, " ")
-      .trim();
-
-
-  const categories = [];
-
-
-  for (
-    const rule of CATEGORY_RULES
-  ) {
-
-    const matched =
-      rule.words.some(
-        word =>
-          text.includes(
-            word
-          )
-      );
-
-
-    if (matched) {
-      categories.push(
-        rule.name
-      );
-    }
-  }
-
-
-  /*
-   * Anything not matched gets
-   * Other.
-   *
-   * It is NEVER removed.
-   */
-  if (
-    categories.length === 0
-  ) {
-    categories.push(
-      "Other"
-    );
-  }
-
-
-  /*
-   * Financial Results is now
-   * deliberately strict.
-   */
-  const isFinancialResult =
-    categories.includes(
-      "Financial Results"
-    );
-
-
-  return {
-
-    /*
-     * Primary category.
-     */
-    category:
-      categories[0],
-
-    /*
-     * Announcement can belong
-     * to multiple virtual feeds.
-     */
-    categories,
-
-    isFinancialResult,
-  };
-}
-
-
-/* ============================================================
-   FINANCIAL RESULTS RSS PARSER
+   FINANCIAL RESULTS PARSER
    ============================================================ */
 
 function parseFinancialResults(
@@ -756,11 +398,13 @@ function parseFinancialResults(
         "title"
       );
 
+
     const link =
       xmlTag(
         itemXML,
         "link"
       );
+
 
     const description =
       xmlTag(
@@ -770,6 +414,7 @@ function parseFinancialResults(
 
 
     if (!title) {
+
       continue;
     }
 
@@ -787,13 +432,17 @@ function parseFinancialResults(
       );
 
 
-    if (titleMatch) {
+    if (
+      titleMatch
+    ) {
 
       company =
-        titleMatch[1].trim();
+        titleMatch[1]
+          .trim();
 
       scrip =
-        titleMatch[2].trim();
+        titleMatch[2]
+          .trim();
     }
 
 
@@ -801,7 +450,8 @@ function parseFinancialResults(
       description
         .split("|")
         .map(
-          x => x.trim()
+          x =>
+            x.trim()
         )
         .filter(Boolean);
 
@@ -831,18 +481,26 @@ function parseFinancialResults(
 
 
       if (
-        lower === "audited" ||
-        lower === "unaudited"
+        lower ===
+          "audited" ||
+
+        lower ===
+          "unaudited"
       ) {
+
         resultType =
           part;
       }
 
 
       if (
-        lower === "standalone" ||
-        lower === "consolidated"
+        lower ===
+          "standalone" ||
+
+        lower ===
+          "consolidated"
       ) {
+
         basis =
           part;
       }
@@ -856,10 +514,12 @@ function parseFinancialResults(
 
         periodStart =
           part
+
             .replace(
               /period start date\s*:/i,
               ""
             )
+
             .trim();
       }
 
@@ -872,10 +532,12 @@ function parseFinancialResults(
 
         periodEnd =
           part
+
             .replace(
               /period end date\s*:/i,
               ""
             )
+
             .trim();
       }
 
@@ -888,10 +550,12 @@ function parseFinancialResults(
 
         indAs =
           part
+
             .replace(
               /ind as\/non ind as\s*:/i,
               ""
             )
+
             .trim();
       }
     }
@@ -916,6 +580,15 @@ function parseFinancialResults(
 
       indAs,
 
+      title,
+
+      link,
+
+      description,
+
+      pubDate:
+        "",
+
       category:
         "Financial Results",
 
@@ -926,19 +599,10 @@ function parseFinancialResults(
       isFinancialResult:
         true,
 
-      title,
-
-      link,
-
-      description,
-
       guid:
         link ||
         `${title}|${description}`,
 
-      id:
-        link ||
-        `${title}|${description}`,
     });
   }
 
@@ -946,13 +610,17 @@ function parseFinancialResults(
   return items;
 }
 
+
 /* ============================================================
    CORPORATE ANNOUNCEMENTS PARSER
    ============================================================ */
 
-function parseCorporateAnnouncements(xml) {
+function parseCorporateAnnouncements(
+  xml
+) {
 
   const items = [];
+
 
   const matches =
     xml.match(
@@ -970,11 +638,13 @@ function parseCorporateAnnouncements(xml) {
         "title"
       );
 
+
     const link =
       xmlTag(
         itemXML,
         "link"
       );
+
 
     const description =
       xmlTag(
@@ -982,11 +652,13 @@ function parseCorporateAnnouncements(xml) {
         "description"
       );
 
+
     const pubDate =
       xmlTag(
         itemXML,
         "pubDate"
       );
+
 
     const guid =
       xmlTag(
@@ -995,20 +667,14 @@ function parseCorporateAnnouncements(xml) {
       );
 
 
-    /*
-     * Ignore completely empty RSS items.
-     */
     if (
       !title &&
       !description
     ) {
+
       continue;
     }
 
-
-    /* --------------------------------------------------------
-       COMPANY + SCRIP
-       -------------------------------------------------------- */
 
     let company =
       "";
@@ -1018,9 +684,9 @@ function parseCorporateAnnouncements(xml) {
 
 
     /*
-     * Normal BSE RSS title:
+     * Common BSE format:
      *
-     * Company Name (500000)
+     * Company Name (123456)
      */
     const titleMatch =
       title.match(
@@ -1028,20 +694,23 @@ function parseCorporateAnnouncements(xml) {
       );
 
 
-    if (titleMatch) {
+    if (
+      titleMatch
+    ) {
 
       company =
-        titleMatch[1].trim();
+        titleMatch[1]
+          .trim();
 
       scrip =
-        titleMatch[2].trim();
+        titleMatch[2]
+          .trim();
     }
 
 
     /*
-     * Fallback:
-     * search title + description
-     * for a six-digit BSE scrip.
+     * Search for six digit
+     * BSE scrip anywhere.
      */
     if (!scrip) {
 
@@ -1052,7 +721,9 @@ function parseCorporateAnnouncements(xml) {
           );
 
 
-      if (scripMatch) {
+      if (
+        scripMatch
+      ) {
 
         scrip =
           scripMatch[1];
@@ -1061,7 +732,9 @@ function parseCorporateAnnouncements(xml) {
 
 
     /*
-     * Fallback company extraction.
+     * Try to identify company name
+     * from description if title
+     * did not contain it.
      */
     if (!company) {
 
@@ -1071,93 +744,36 @@ function parseCorporateAnnouncements(xml) {
         );
 
 
-      if (companyMatch) {
+      if (
+        companyMatch
+      ) {
 
         company =
-          companyMatch[1].trim();
+          companyMatch[1]
+            .trim();
       }
     }
 
 
-    /* --------------------------------------------------------
-       CLASSIFY
-       -------------------------------------------------------- */
-
-    const classification =
+    /*
+     * Category will be assigned
+     * below.
+     */
+    const category =
       classifyAnnouncement(
         title,
         description
       );
 
 
-    /* --------------------------------------------------------
-       STABLE ID
-       -------------------------------------------------------- */
-
-    const stableId =
-      guid ||
-      link ||
-      `${title}|${description}|${pubDate}`;
-
-
-    /* --------------------------------------------------------
-       ITEM
-       -------------------------------------------------------- */
-
     items.push({
 
       feed:
         "Corporate Announcements",
 
-
       company,
 
       scrip,
-
-
-      /*
-       * Primary category.
-       */
-      category:
-        classification.category,
-
-
-      /*
-       * All matching categories.
-       */
-      categories:
-        classification.categories,
-
-
-      /*
-       * Strict Financial Results flag.
-       */
-      isFinancialResult:
-        classification.isFinancialResult,
-
-
-      resultType:
-        classification.isFinancialResult
-          ? "Financial Result"
-          : "",
-
-
-      /*
-       * Kept for compatibility with
-       * the existing reader.
-       */
-      basis:
-        "",
-
-      periodStart:
-        "",
-
-      periodEnd:
-        "",
-
-      indAs:
-        "",
-
 
       title,
 
@@ -1167,12 +783,21 @@ function parseCorporateAnnouncements(xml) {
 
       pubDate,
 
-
       guid:
-        stableId,
+        guid ||
+        link ||
+        `${title}|${description}`,
 
-      id:
-        stableId,
+      category,
+
+      categories: [
+        category
+      ],
+
+      isFinancialResult:
+        category ===
+        "Financial Results",
+
     });
   }
 
@@ -1182,38 +807,460 @@ function parseCorporateAnnouncements(xml) {
 
 
 /* ============================================================
-   BSE FEED FETCHERS
+   CATEGORY CLASSIFICATION
    ============================================================ */
 
-async function fetchFinancialResults() {
+function classifyAnnouncement(
+  title,
+  description
+) {
 
-  const xml =
-    await fetchXML(
-      FINANCIAL_RESULTS_URL
+  const text =
+    normalizeText(
+      `${title} ${description}`
     );
 
 
-  const items =
-    parseFinancialResults(
-      xml
-    );
+  /*
+   * IMPORTANT:
+   *
+   * More specific categories must be
+   * checked before broad categories.
+   *
+   * For example:
+   * "Board Meeting to consider financial
+   * results" should be Financial Results
+   * rather than simply Board Meeting.
+   */
 
 
-  return {
+  /* ----------------------------------------------------------
+     FINANCIAL RESULTS
+     ---------------------------------------------------------- */
 
-    feed:
-      "Financial Results",
+  if (
+    /\bfinancial results?\b/.test(text) ||
 
-    feedUrl:
-      FINANCIAL_RESULTS_URL,
+    /\bquarterly results?\b/.test(text) ||
 
-    count:
-      items.length,
+    /\bhalf year results?\b/.test(text) ||
 
-    items,
-  };
+    /\bannual results?\b/.test(text) ||
+
+    /\bunaudited financial results?\b/.test(text) ||
+
+    /\baudited financial results?\b/.test(text) ||
+
+    /\bfinancial statements?\b/.test(text) ||
+
+    /\bresults? for the (quarter|period)\b/.test(text) ||
+
+    /\bresults? for .* quarter\b/.test(text)
+  ) {
+
+    return "Financial Results";
+  }
+
+
+  /* ----------------------------------------------------------
+     BOARD MEETING
+     ---------------------------------------------------------- */
+
+  if (
+    /\bboard meeting\b/.test(text) ||
+
+    /\bmeeting of the board\b/.test(text) ||
+
+    /\bmeeting of board of directors\b/.test(text)
+  ) {
+
+    return "Board Meeting";
+  }
+
+
+  /* ----------------------------------------------------------
+     DIVIDEND
+     ---------------------------------------------------------- */
+
+  if (
+    /\bdividend\b/.test(text) ||
+
+    /\binterim dividend\b/.test(text) ||
+
+    /\bfinal dividend\b/.test(text) ||
+
+    /\bdividend payment\b/.test(text)
+  ) {
+
+    return "Dividend";
+  }
+
+
+  /* ----------------------------------------------------------
+     AGM / EGM
+     ---------------------------------------------------------- */
+
+  if (
+    /\bagm\b/.test(text) ||
+
+    /\begm\b/.test(text) ||
+
+    /\bannual general meeting\b/.test(text) ||
+
+    /\bextraordinary general meeting\b/.test(text) ||
+
+    /\bgeneral meeting\b/.test(text)
+  ) {
+
+    return "AGM / EGM";
+  }
+
+
+  /* ----------------------------------------------------------
+     REGULATORY / LEGAL
+     ---------------------------------------------------------- */
+
+  if (
+    /\bsebi\b/.test(text) ||
+
+    /\bregulatory\b/.test(text) ||
+
+    /\blegal\b/.test(text) ||
+
+    /\bpenalty\b/.test(text) ||
+
+    /\border of sebi\b/.test(text) ||
+
+    /\bshow cause notice\b/.test(text) ||
+
+    /\bcourt\b/.test(text) ||
+
+    /\blitigation\b/.test(text)
+  ) {
+
+    return "Regulatory / Legal";
+  }
+
+
+  /* ----------------------------------------------------------
+     NEWSPAPER ADVERTISEMENT
+     ---------------------------------------------------------- */
+
+  if (
+    /\bnewspaper advertisement\b/.test(text) ||
+
+    /\bnewspaper publication\b/.test(text) ||
+
+    /\bpublication of advertisement\b/.test(text)
+  ) {
+
+    return "Newspaper Advertisement";
+  }
+
+
+  /* ----------------------------------------------------------
+     ANNUAL REPORT
+     ---------------------------------------------------------- */
+
+  if (
+    /\bannual report\b/.test(text) ||
+
+    /\bannual accounts\b/.test(text)
+  ) {
+
+    return "Annual Report";
+  }
+
+
+  /* ----------------------------------------------------------
+     APPOINTMENT / RESIGNATION
+     ---------------------------------------------------------- */
+
+  if (
+    /\bappointment\b/.test(text) ||
+
+    /\bresignation\b/.test(text) ||
+
+    /\bappointed as\b/.test(text) ||
+
+    /\bresigned\b/.test(text) ||
+
+    /\bcessation\b/.test(text)
+  ) {
+
+    return "Appointment / Resignation";
+  }
+
+
+  /* ----------------------------------------------------------
+     ACQUISITION
+     ---------------------------------------------------------- */
+
+  if (
+    /\bacquisition\b/.test(text) ||
+
+    /\bacquire\b/.test(text) ||
+
+    /\bacquired\b/.test(text)
+  ) {
+
+    return "Acquisition";
+  }
+
+
+  /* ----------------------------------------------------------
+     MERGER / AMALGAMATION
+     ---------------------------------------------------------- */
+
+  if (
+    /\bmerger\b/.test(text) ||
+
+    /\bamalgamation\b/.test(text) ||
+
+    /\bscheme of arrangement\b/.test(text)
+  ) {
+
+    return "Merger / Amalgamation";
+  }
+
+
+  /* ----------------------------------------------------------
+     CREDIT RATING
+     ---------------------------------------------------------- */
+
+  if (
+    /\bcredit rating\b/.test(text) ||
+
+    /\brating reaffirmed\b/.test(text) ||
+
+    /\brating upgraded\b/.test(text) ||
+
+    /\brating downgraded\b/.test(text) ||
+
+    /\bcredit opinion\b/.test(text)
+  ) {
+
+    return "Credit Rating";
+  }
+
+
+  /* ----------------------------------------------------------
+     FUND RAISING
+     ---------------------------------------------------------- */
+
+  if (
+    /\bfund raising\b/.test(text) ||
+
+    /\bfundraising\b/.test(text) ||
+
+    /\bissue of securities\b/.test(text) ||
+
+    /\bprivate placement\b/.test(text) ||
+
+    /\bdebt raising\b/.test(text)
+  ) {
+
+    return "Fund Raising";
+  }
+
+
+  /* ----------------------------------------------------------
+     PREFERENTIAL ISSUE
+     ---------------------------------------------------------- */
+
+  if (
+    /\bpreferential issue\b/.test(text) ||
+
+    /\bpreferential allotment\b/.test(text)
+  ) {
+
+    return "Preferential Issue";
+  }
+
+
+  /* ----------------------------------------------------------
+     RIGHTS ISSUE
+     ---------------------------------------------------------- */
+
+  if (
+    /\bright issue\b/.test(text) ||
+
+    /\brights issue\b/.test(text)
+  ) {
+
+    return "Rights Issue";
+  }
+
+
+  /* ----------------------------------------------------------
+     BUYBACK
+     ---------------------------------------------------------- */
+
+  if (
+    /\bbuyback\b/.test(text) ||
+
+    /\bbuy back\b/.test(text)
+  ) {
+
+    return "Buyback";
+  }
+
+
+  /* ----------------------------------------------------------
+     BONUS
+     ---------------------------------------------------------- */
+
+  if (
+    /\bbonus issue\b/.test(text) ||
+
+    /\bbonus shares\b/.test(text)
+  ) {
+
+    return "Bonus";
+  }
+
+
+  /* ----------------------------------------------------------
+     ALLOTMENT
+     ---------------------------------------------------------- */
+
+  if (
+    /\ballotment\b/.test(text) ||
+
+    /\ballotment of shares\b/.test(text) ||
+
+    /\ballotment of securities\b/.test(text)
+  ) {
+
+    return "Allotment";
+  }
+
+
+  /* ----------------------------------------------------------
+     SHAREHOLDING
+     ---------------------------------------------------------- */
+
+  if (
+    /\bshareholding\b/.test(text) ||
+
+    /\bshareholding pattern\b/.test(text) ||
+
+    /\bshare holders?\b/.test(text)
+  ) {
+
+    return "Shareholding";
+  }
+
+
+  /* ----------------------------------------------------------
+     TRADING / INSIDER
+     ---------------------------------------------------------- */
+
+  if (
+    /\btrading window\b/.test(text) ||
+
+    /\btrading window closure\b/.test(text) ||
+
+    /\binsider trading\b/.test(text) ||
+
+    /\bcode of conduct\b/.test(text) ||
+
+    /\bpromoter trading\b/.test(text) ||
+
+    /\bdisclosure under sebi\b/.test(text)
+  ) {
+
+    return "Trading / Insider";
+  }
+
+
+  /* ----------------------------------------------------------
+     CORPORATE ACTION
+     ---------------------------------------------------------- */
+
+  if (
+    /\bcorporate action\b/.test(text) ||
+
+    /\brecord date\b/.test(text) ||
+
+    /\bbook closure\b/.test(text) ||
+
+    /\bface value\b/.test(text) ||
+
+    /\bsplit\b/.test(text)
+  ) {
+
+    return "Corporate Action";
+  }
+
+
+  /* ----------------------------------------------------------
+     INVESTOR / ANALYST MEET
+     ---------------------------------------------------------- */
+
+  if (
+    /\binvestor meet\b/.test(text) ||
+
+    /\binvestor meeting\b/.test(text) ||
+
+    /\banalyst meet\b/.test(text) ||
+
+    /\banalyst meeting\b/.test(text) ||
+
+    /\binvestor conference\b/.test(text)
+  ) {
+
+    return "Investor / Analyst Meet";
+  }
+
+
+  /* ----------------------------------------------------------
+     ORDER / CONTRACT
+     ---------------------------------------------------------- */
+
+  if (
+    /\border received\b/.test(text) ||
+
+    /\bwork order\b/.test(text) ||
+
+    /\bcontract received\b/.test(text) ||
+
+    /\border worth\b/.test(text) ||
+
+    /\bcontract worth\b/.test(text)
+  ) {
+
+    return "Order / Contract";
+  }
+
+
+  /* ----------------------------------------------------------
+     PRESS RELEASE
+     ---------------------------------------------------------- */
+
+  if (
+    /\bpress release\b/.test(text) ||
+
+    /\bmedia release\b/.test(text) ||
+
+    /\bpress statement\b/.test(text)
+  ) {
+
+    return "Press Release";
+  }
+
+
+  /*
+   * Anything not confidently classified
+   * remains visible as Other.
+   */
+  return "Other";
 }
 
+
+/* ============================================================
+   FETCH + PARSE ALL BSE ANNOUNCEMENTS
+   ============================================================ */
 
 async function fetchCorporateAnnouncements() {
 
@@ -1223,217 +1270,97 @@ async function fetchCorporateAnnouncements() {
     );
 
 
-  const items =
-    parseCorporateAnnouncements(
+  return parseCorporateAnnouncements(
+    xml
+  );
+}
+
+
+/* ============================================================
+   FETCH FINANCIAL RESULTS
+   ============================================================ */
+
+async function fetchFinancialResults() {
+
+  try {
+
+    const xml =
+      await fetchXML(
+        FINANCIAL_RESULTS_URL
+      );
+
+
+    return parseFinancialResults(
       xml
     );
 
+  } catch (
+    error
+  ) {
 
-  return {
-
-    feed:
-      "Corporate Announcements",
-
-    feedUrl:
-      CORPORATE_ANNOUNCEMENTS_URL,
-
-    count:
-      items.length,
-
-    items,
-  };
-}
+    console.error(
+      "Financial Results feed error:",
+      error
+    );
 
 
-/* ============================================================
-   WATCHLIST
-   ============================================================ */
-
-async function getWatchlist(env) {
-
-  if (!env.BSE_KV) {
     return [];
   }
-
-
-  const data =
-    await env.BSE_KV.get(
-      "watchlist",
-      "json"
-    );
-
-
-  return Array.isArray(data)
-    ? data
-    : [];
 }
 
 
-async function setWatchlist(
-  env,
-  watchlist
-) {
+/* ============================================================
+   FETCH MAIN BSE DATASET
+   ============================================================ */
 
-  if (!env.BSE_KV) {
+async function fetchBSEAnnouncements() {
 
-    throw new Error(
-      "BSE_KV KV namespace is not configured."
-    );
-  }
+  const corporate =
+    await fetchCorporateAnnouncements();
 
 
-  await env.BSE_KV.put(
-    "watchlist",
-    JSON.stringify(
-      watchlist
-    )
-  );
-}
+  /*
+   * We keep the separate Financial Results
+   * feed as additional information.
+   *
+   * It is NOT treated as the authoritative
+   * real-time results source.
+   */
+  const financial =
+    await fetchFinancialResults();
 
 
-/*
- * Watchlist format:
- *
- * [
- *   {
- *     "scrip": "532540",
- *     "name": "TCS"
- *   }
- * ]
- *
- * Scrip matching is preferred.
- */
-
-function matchesWatchlist(
-  item,
-  watchlist
-) {
-
-  if (
-    !Array.isArray(
-      watchlist
-    ) ||
-    watchlist.length === 0
-  ) {
-
-    return false;
-  }
+  /*
+   * Corporate Announcements is the primary
+   * source. Financial Results feed is
+   * supplementary.
+   */
+  const all = [
+    ...corporate,
+    ...financial
+  ];
 
 
-  return watchlist.some(
-    watch => {
-
-      /*
-       * Exact BSE scrip match.
-       */
-      if (
-        watch.scrip &&
-        item.scrip &&
-        String(
-          watch.scrip
-        ) ===
-        String(
-          item.scrip
-        )
-      ) {
-
-        return true;
-      }
-
-
-      /*
-       * Exact company-name
-       * fallback.
-       */
-      if (
-        watch.name &&
-        item.company
-      ) {
-
-        return (
-          String(
-            watch.name
-          )
-            .trim()
-            .toLowerCase()
-          ===
-          String(
-            item.company
-          )
-            .trim()
-            .toLowerCase()
-        );
-      }
-
-
-      return false;
-    }
+  return dedupeAnnouncements(
+    all
   );
 }
 
 
 /* ============================================================
-   GET ALL PHYSICAL BSE FEEDS
+   BASIC ANNOUNCEMENT DEDUPLICATION
    ============================================================ */
 
-async function getAllFeeds() {
-
-  const results =
-    await Promise.allSettled([
-      fetchFinancialResults(),
-      fetchCorporateAnnouncements(),
-    ]);
-
-
-  const feeds = [];
-
-  const errors = [];
-
-
-  for (
-    const result of results
-  ) {
-
-    if (
-      result.status ===
-      "fulfilled"
-    ) {
-
-      feeds.push(
-        result.value
-      );
-
-    } else {
-
-      errors.push(
-        String(
-          result.reason?.message ||
-          result.reason
-        )
-      );
-    }
-  }
-
-
-  return {
-
-    feeds,
-
-    errors,
-  };
-}
-
-
-/* ============================================================
-   CATEGORY SUMMARY
-   ============================================================ */
-
-function buildCategorySummary(
+async function dedupeAnnouncements(
   items
 ) {
 
-  const map =
-    new Map();
+  const seen =
+    new Set();
+
+
+  const result =
+    [];
 
 
   for (
@@ -1441,141 +1368,381 @@ function buildCategorySummary(
   ) {
 
     /*
-     * An announcement may belong
-     * to multiple virtual categories.
+     * First preference:
+     * BSE GUID.
      */
-    const categories =
-      Array.isArray(
-        item.categories
-      ) &&
-      item.categories.length
-        ? item.categories
-        : [
-            item.category ||
-            "Other"
-          ];
+    let key =
+      item.guid ||
+      item.link;
 
 
-    for (
-      const category of categories
+    /*
+     * If GUID/link isn't useful,
+     * build a normalized fallback.
+     */
+    if (!key) {
+
+      key =
+        [
+          item.scrip,
+          normalizeText(
+            item.title
+          ),
+          normalizeText(
+            item.description
+          )
+        ]
+          .join("|");
+    }
+
+
+    if (
+      seen.has(key)
     ) {
 
-      map.set(
-        category,
-
-        (
-          map.get(
-            category
-          ) || 0
-        ) + 1
-      );
+      continue;
     }
+
+
+    seen.add(
+      key
+    );
+
+
+    result.push(
+      item
+    );
   }
 
 
-  return Array
-    .from(
-      map.entries()
+  return result;
+}
+
+
+/* ============================================================
+   DUPLICATE FINGERPRINT
+   ============================================================ */
+
+async function announcementFingerprint(
+  item
+) {
+
+  /*
+   * We intentionally do NOT include
+   * publication time.
+   *
+   * BSE may publish the same announcement
+   * more than once with different timestamps.
+   */
+
+  const source =
+    [
+      String(
+        item.scrip || ""
+      )
+        .trim(),
+
+      normalizeText(
+        item.company || ""
+      ),
+
+      normalizeText(
+        item.title || ""
+      ),
+
+      normalizeText(
+        item.description || ""
+      )
+    ]
+      .join("|");
+
+
+  const bytes =
+    new TextEncoder()
+      .encode(
+        source
+      );
+
+
+  const hash =
+    await crypto.subtle.digest(
+      "SHA-256",
+      bytes
+    );
+
+
+  return Array.from(
+    new Uint8Array(
+      hash
     )
+  )
     .map(
-      ([name, count]) => ({
-        name,
-        count,
-      })
+      byte =>
+        byte
+          .toString(16)
+          .padStart(
+            2,
+            "0"
+          )
     )
-    .sort(
-      (a, b) =>
-        b.count - a.count
+    .join("");
+}
+
+
+/* ============================================================
+   WATCHLIST NORMALIZATION
+   ============================================================ */
+
+function normalizeWatchlist(
+  list
+) {
+
+  if (
+    !Array.isArray(
+      list
+    )
+  ) {
+
+    return [];
+  }
+
+
+  return list
+    .map(
+      entry => {
+
+        if (
+          typeof entry ===
+          "string"
+        ) {
+
+          return {
+            scrip:
+              entry.trim(),
+
+            name:
+              "",
+          };
+        }
+
+
+        return {
+
+          scrip:
+            String(
+              entry.scrip ||
+              ""
+            )
+              .trim(),
+
+          name:
+            String(
+              entry.name ||
+              ""
+            )
+              .trim(),
+
+        };
+      }
+    )
+    .filter(
+      entry =>
+        entry.scrip ||
+        entry.name
     );
 }
 
 
 /* ============================================================
-   PERSISTENT SEEN ITEMS
+   LOAD WATCHLIST
    ============================================================ */
 
-async function getSeen(env) {
+async function getWatchlist(
+  env
+) {
 
-  if (!env.BSE_KV) {
+  if (
+    !env.BSE_KV
+  ) {
+
     return [];
   }
 
 
-  const data =
+  const value =
     await env.BSE_KV.get(
-      "announcementSeen",
+      WATCHLIST_KEY,
       "json"
     );
 
 
-  return Array.isArray(data)
-    ? data
-    : [];
-}
-
-
-async function saveSeen(
-  env,
-  ids
-) {
-
-  if (!env.BSE_KV) {
-    return;
-  }
-
-
-  await env.BSE_KV.put(
-    "announcementSeen",
-
-    JSON.stringify(
-      ids.slice(
-        0,
-        MAX_SEEN
-      )
-    )
+  return normalizeWatchlist(
+    value
   );
 }
 
 
 /* ============================================================
-   PERSISTENT ALERTS
+   SAVE WATCHLIST
    ============================================================ */
 
-async function getAlerts(env) {
+async function saveWatchlist(
+  env,
+  list
+) {
 
-  if (!env.BSE_KV) {
+  if (
+    !env.BSE_KV
+  ) {
+
+    throw new Error(
+      "BSE_KV binding is missing."
+    );
+  }
+
+
+  const normalized =
+    normalizeWatchlist(
+      list
+    );
+
+
+  await env.BSE_KV.put(
+    WATCHLIST_KEY,
+    JSON.stringify(
+      normalized
+    )
+  );
+
+
+  return normalized;
+}
+
+
+/* ============================================================
+   WHITELIST MATCH
+   ============================================================ */
+
+function matchesWatchlist(
+  item,
+  watchlist
+) {
+
+  const itemScrip =
+    String(
+      item.scrip ||
+      ""
+    )
+      .trim();
+
+
+  const itemCompany =
+    normalizeText(
+      item.company
+    );
+
+
+  if (!itemScrip) {
+
+    return false;
+  }
+
+
+  for (
+    const watch of watchlist
+  ) {
+
+    /*
+     * BSE SCRIP is the primary
+     * matching method.
+     */
+    if (
+      watch.scrip &&
+      itemScrip ===
+        String(
+          watch.scrip
+        )
+          .trim()
+    ) {
+
+      return true;
+    }
+
+
+    /*
+     * Name is only a fallback.
+     */
+    if (
+      !watch.scrip &&
+      watch.name &&
+      itemCompany ===
+        normalizeText(
+          watch.name
+        )
+    ) {
+
+      return true;
+    }
+  }
+
+
+  return false;
+}
+
+
+
+/* ============================================================
+   ALERT STORAGE
+   ============================================================ */
+
+async function getAlertIndex(
+  env
+) {
+
+  if (
+    !env.BSE_KV
+  ) {
+
     return [];
   }
 
 
   const data =
     await env.BSE_KV.get(
-      "specialAlerts",
+      ALERT_INDEX_KEY,
       "json"
     );
 
 
-  return Array.isArray(data)
+  return Array.isArray(
+    data
+  )
     ? data
     : [];
 }
 
 
-async function saveAlerts(
+/* ============================================================
+   SAVE ALERT INDEX
+   ============================================================ */
+
+async function saveAlertIndex(
   env,
-  alerts
+  ids
 ) {
 
-  if (!env.BSE_KV) {
+  if (
+    !env.BSE_KV
+  ) {
+
     return;
   }
 
 
   await env.BSE_KV.put(
-    "specialAlerts",
-
+    ALERT_INDEX_KEY,
     JSON.stringify(
-      alerts.slice(
+      ids.slice(
         0,
         MAX_ALERTS
       )
@@ -1583,1161 +1750,648 @@ async function saveAlerts(
   );
 }
 
+
 /* ============================================================
-   MONITOR BSE CORPORATE ANNOUNCEMENTS
+   GET STORED ALERTS
    ============================================================ */
 
-async function monitorFeeds(env) {
+async function getAlerts(
+  env
+) {
 
-  const result =
-    await getAllFeeds();
-
-
-  /*
-   * Corporate Announcements is the
-   * primary real-time monitoring feed.
-   */
-  const corporateFeed =
-    result.feeds.find(
-      feed =>
-        feed.feed ===
-        "Corporate Announcements"
-    );
-
-
-  const items =
-    corporateFeed?.items ||
-    [];
-
-
-  const watchlist =
-    await getWatchlist(
-      env
-    );
-
-
-  const seen =
-    await getSeen(
+  const index =
+    await getAlertIndex(
       env
     );
 
 
   const alerts =
-    await getAlerts(
-      env
-    );
+    [];
 
 
-  /* ----------------------------------------------------------
-     FIRST RUN / BASELINE
-     ---------------------------------------------------------- */
+  const validIds =
+    [];
+
 
   /*
-   * On the first monitoring run we establish
-   * the current BSE feed as the baseline.
+   * KV automatically removes expired
+   * alert records.
    *
-   * Existing announcements therefore do NOT
-   * generate alerts.
+   * Therefore the index may contain
+   * IDs whose records no longer exist.
    */
-  if (
-    seen.length === 0
+  for (
+    const id of index
   ) {
 
-    const ids =
-      items
-        .map(
-          item =>
-            item.id ||
-            item.guid
-        )
-        .filter(Boolean);
+    const alert =
+      await env.BSE_KV.get(
+        `alert:${id}`,
+        "json"
+      );
 
 
-    await saveSeen(
+    if (
+      alert
+    ) {
+
+      alerts.push(
+        alert
+      );
+
+      validIds.push(
+        id
+      );
+    }
+  }
+
+
+  /*
+   * Clean expired IDs from the index.
+   */
+  if (
+    validIds.length !==
+    index.length
+  ) {
+
+    await saveAlertIndex(
       env,
-      ids
+      validIds
     );
+  }
 
+
+  /*
+   * Newest first.
+   */
+  alerts.sort(
+    (
+      a,
+      b
+    ) =>
+      String(
+        b.createdAt || ""
+      )
+        .localeCompare(
+          String(
+            a.createdAt || ""
+          )
+        )
+  );
+
+
+  return alerts;
+}
+
+
+/* ============================================================
+   CREATE ALERT
+   ============================================================ */
+
+async function createAlert(
+  env,
+  item
+) {
+
+  if (
+    !env.BSE_KV
+  ) {
 
     return {
 
-      monitored:
-        true,
+      created:
+        false,
 
-      baseline:
-        true,
+      reason:
+        "BSE_KV binding missing.",
 
-      announcements:
-        items.length,
-
-      watchlist:
-        watchlist.length,
-
-      newAnnouncements:
-        0,
-
-      newAlerts:
-        0,
-
-      errors:
-        result.errors,
     };
   }
 
 
-  /* ----------------------------------------------------------
-     FIND NEW ANNOUNCEMENTS
-     ---------------------------------------------------------- */
-
-  const seenSet =
-    new Set(
-      seen
+  const alertId =
+    await announcementFingerprint(
+      item
     );
 
 
-  const newItems =
-    items.filter(
-      item => {
+  /*
+   * Permanent-ish duplicate protection
+   * for the alert retention period.
+   *
+   * This is separate from the RSS GUID.
+   */
+  const duplicateKey =
+    `alert:${alertId}`;
 
-        const id =
-          item.id ||
-          item.guid;
 
-
-        return (
-          id &&
-          !seenSet.has(
-            id
-          )
-        );
-      }
+  const existing =
+    await env.BSE_KV.get(
+      duplicateKey
     );
 
 
-  let newAlerts =
-    0;
-
-
-  /* ----------------------------------------------------------
-     CREATE ALERTS FOR WHITELISTED SCRIPS
-     ---------------------------------------------------------- */
-
-  for (
-    const item of newItems
+  if (
+    existing
   ) {
 
-    /*
-     * ALL new announcements are still
-     * retained in the normal BSE feed.
-     *
-     * Only announcements belonging to
-     * a whitelisted company become alerts.
-     */
-    if (
-      !matchesWatchlist(
-        item,
-        watchlist
-      )
-    ) {
+    return {
 
-      continue;
-    }
+      created:
+        false,
 
-
-    const id =
-      item.id ||
-      item.guid;
-
-
-    /*
-     * Never create the same alert twice.
-     */
-    if (
-      alerts.some(
-        alert =>
-          alert.id === id
-      )
-    ) {
-
-      continue;
-    }
-
-
-    alerts.unshift({
-
-      ...item,
-
-
-      alert:
+      duplicate:
         true,
 
+      alertId,
 
-      alertType:
-        item.isFinancialResult
-          ? "Financial Result"
-          : "BSE Announcement",
-
-
-      specialBundle:
-        "Alerts / Special Bundle",
-
-
-      alertCreatedAt:
-        new Date().toISOString(),
-    });
-
-
-    newAlerts++;
+    };
   }
 
 
-  /* ----------------------------------------------------------
-     SAVE SEEN IDS
-     ---------------------------------------------------------- */
+  const now =
+    new Date()
+      .toISOString();
 
-  const allSeen = [
 
-    ...newItems.map(
-      item =>
-        item.id ||
-        item.guid
+  const alert = {
+
+    alertId,
+
+    createdAt:
+      now,
+
+    isNew:
+      true,
+
+    specialBundle:
+      true,
+
+    company:
+      item.company ||
+      "",
+
+    scrip:
+      item.scrip ||
+      "",
+
+    title:
+      item.title ||
+      "",
+
+    description:
+      item.description ||
+      "",
+
+    link:
+      item.link ||
+      "",
+
+    pubDate:
+      item.pubDate ||
+      "",
+
+    category:
+      item.category ||
+      "Other",
+
+    categories:
+      Array.isArray(
+        item.categories
+      )
+        ? item.categories
+        : [
+            item.category ||
+            "Other"
+          ],
+
+    feed:
+      item.feed ||
+      "Corporate Announcements",
+
+    isFinancialResult:
+      !!item.isFinancialResult,
+
+    guid:
+      item.guid ||
+      "",
+
+  };
+
+
+  /*
+   * Store alert with automatic expiry.
+   */
+  await env.BSE_KV.put(
+
+    duplicateKey,
+
+    JSON.stringify(
+      alert
     ),
 
-    ...seen,
-  ];
-
-
-  const uniqueSeen =
-    [];
-
-
-  for (
-    const id of allSeen
-  ) {
-
-    if (!id) {
-      continue;
+    {
+      expirationTtl:
+        ALERT_TTL_SECONDS,
     }
 
-
-    if (
-      !uniqueSeen.includes(
-        id
-      )
-    ) {
-
-      uniqueSeen.push(
-        id
-      );
-    }
-
-
-    if (
-      uniqueSeen.length >=
-      MAX_SEEN
-    ) {
-
-      break;
-    }
-  }
-
-
-  await saveSeen(
-    env,
-    uniqueSeen
   );
 
 
-  await saveAlerts(
+  /*
+   * Add ID to alert index.
+   */
+  const index =
+    await getAlertIndex(
+      env
+    );
+
+
+  const newIndex = [
+
+    alertId,
+
+    ...index.filter(
+      id =>
+        id !==
+        alertId
+    ),
+
+  ]
+    .slice(
+      0,
+      MAX_ALERTS
+    );
+
+
+  await saveAlertIndex(
     env,
-    alerts
+    newIndex
   );
 
 
   return {
 
-    monitored:
+    created:
       true,
 
-    baseline:
+    duplicate:
       false,
 
-    announcements:
-      items.length,
+    alertId,
 
-    newAnnouncements:
-      newItems.length,
+    alert,
 
-    watchlist:
-      watchlist.length,
-
-    newAlerts,
-
-    totalAlerts:
-      alerts.length,
-
-    errors:
-      result.errors,
   };
 }
 
 
 /* ============================================================
-   FINANCIAL RESULTS ENDPOINT
+   DUPLICATE MEMORY
    ============================================================ */
 
-async function handleFinancialResults() {
-
-  try {
-
-    const result =
-      await fetchFinancialResults();
-
-
-    return json({
-
-      ok:
-        true,
-
-      source:
-        "BSE Financial Results RSS",
-
-      feedUrl:
-        FINANCIAL_RESULTS_URL,
-
-      fetchedAt:
-        new Date().toISOString(),
-
-      count:
-        result.items.length,
-
-      items:
-        result.items,
-
-    });
-
-  } catch (
-    error
-  ) {
-
-    return json({
-
-      ok:
-        false,
-
-      source:
-        "BSE Financial Results RSS",
-
-      error:
-        error.message,
-
-    }, 502);
-  }
-}
-
-
-/* ============================================================
-   CORPORATE ANNOUNCEMENTS ENDPOINT
-   ============================================================ */
-
-async function handleAnnouncements(
-  request
+async function rememberFingerprint(
+  env,
+  fingerprint
 ) {
 
-  try {
+  if (
+    !env.BSE_KV
+  ) {
 
-    const result =
-      await fetchCorporateAnnouncements();
-
-
-    const url =
-      new URL(
-        request.url
-      );
+    return;
+  }
 
 
-    const requestedCategory =
-      url.searchParams.get(
-        "category"
-      );
+  await env.BSE_KV.put(
 
+    `seen:${fingerprint}`,
 
-    /*
-     * IMPORTANT:
-     *
-     * No category =
-     * ALL BSE announcements.
-     *
-     * Nothing is hidden.
-     */
-    let items =
-      result.items;
+    "1",
 
-
-    /* --------------------------------------------------------
-       OPTIONAL CATEGORY FILTER
-       -------------------------------------------------------- */
-
-    if (
-      requestedCategory
-    ) {
-
-      const wanted =
-        requestedCategory
-          .trim()
-          .toLowerCase();
-
-
-      items =
-        items.filter(
-          item => {
-
-            /*
-             * Primary category.
-             */
-            if (
-              item.category &&
-              item.category
-                .toLowerCase() ===
-                wanted
-            ) {
-
-              return true;
-            }
-
-
-            /*
-             * Secondary category.
-             */
-            if (
-              Array.isArray(
-                item.categories
-              )
-            ) {
-
-              return item.categories.some(
-                category =>
-                  category
-                    .toLowerCase() ===
-                  wanted
-              );
-            }
-
-
-            return false;
-          }
-        );
+    {
+      expirationTtl:
+        DUPLICATE_TTL_SECONDS,
     }
 
-
-    return json({
-
-      ok:
-        true,
-
-      source:
-        "BSE Corporate Announcements RSS",
-
-      feedUrl:
-        CORPORATE_ANNOUNCEMENTS_URL,
-
-      fetchedAt:
-        new Date().toISOString(),
-
-
-      /*
-       * Count before category filtering.
-       */
-      allItemsCount:
-        result.items.length,
-
-
-      /*
-       * Count actually returned.
-       */
-      count:
-        items.length,
-
-
-      category:
-        requestedCategory ||
-        "All",
-
-
-      items,
-
-    });
-
-  } catch (
-    error
-  ) {
-
-    return json({
-
-      ok:
-        false,
-
-      source:
-        "BSE Corporate Announcements RSS",
-
-      error:
-        error.message,
-
-    }, 502);
-  }
+  );
 }
 
 
 /* ============================================================
-   CATEGORY ENDPOINT
+   CHECK DUPLICATE MEMORY
    ============================================================ */
 
-async function handleCategories() {
+async function hasFingerprint(
+  env,
+  fingerprint
+) {
 
-  try {
-
-    const result =
-      await fetchCorporateAnnouncements();
-
-
-    const categories =
-      buildCategorySummary(
-        result.items
-      );
-
-
-    return json({
-
-      ok:
-        true,
-
-      source:
-        "BSE Corporate Announcements RSS",
-
-      allCount:
-        result.items.length,
-
-      categories,
-
-    });
-
-  } catch (
-    error
+  if (
+    !env.BSE_KV
   ) {
 
-    return json({
-
-      ok:
-        false,
-
-      error:
-        error.message,
-
-    }, 502);
+    return false;
   }
-}
-/* ============================================================
-   FEEDS ENDPOINT
-   ============================================================ */
-
-async function handleFeeds() {
-
-  const result =
-    await getAllFeeds();
 
 
-  const allItems =
-    result.feeds.flatMap(
-      feed =>
-        feed.items
+  const value =
+    await env.BSE_KV.get(
+      `seen:${fingerprint}`
     );
 
 
-  return json({
-
-    ok:
-      result.errors.length === 0,
-
-    fetchedAt:
-      new Date().toISOString(),
-
-
-    /*
-     * Physical BSE feeds.
-     */
-    feeds:
-      result.feeds.map(
-        feed => ({
-
-          feed:
-            feed.feed,
-
-          feedUrl:
-            feed.feedUrl,
-
-          count:
-            feed.count,
-        })
-      ),
-
-
-    /*
-     * Virtual category feeds.
-     */
-    categories:
-      buildCategorySummary(
-        allItems
-      ),
-
-
-    errors:
-      result.errors,
-
-
-    count:
-      allItems.length,
-
-
-    /*
-     * ALL announcements remain
-     * available here.
-     */
-    items:
-      allItems,
-  });
+  return !!value;
 }
 
 
 /* ============================================================
-   WATCHLIST GET
+   PROCESS NEW ANNOUNCEMENT
    ============================================================ */
 
-async function handleWatchlistGet(
-  env
+async function processAnnouncement(
+  env,
+  item,
+  watchlist
 ) {
 
-  const watchlist =
-    await getWatchlist(
-      env
-    );
-
-
-  return json({
-
-    ok:
-      true,
-
-    count:
-      watchlist.length,
-
-    watchlist,
-  });
-}
-
-
-/* ============================================================
-   WATCHLIST POST
-   ============================================================ */
-
-async function handleWatchlistPost(
-  request,
-  env
-) {
-
-  let body;
-
-
-  try {
-
-    body =
-      await request.json();
-
-  } catch {
-
-    return json({
-
-      ok:
-        false,
-
-      error:
-        "Invalid JSON body.",
-
-    }, 400);
-  }
-
-
-  const watchlist =
-    Array.isArray(
-      body.watchlist
+  /*
+   * Only whitelisted companies
+   * can create alerts.
+   */
+  if (
+    !matchesWatchlist(
+      item,
+      watchlist
     )
-      ? body.watchlist
-      : null;
+  ) {
 
+    return {
 
-  if (!watchlist) {
-
-    return json({
-
-      ok:
+      matched:
         false,
 
-      error:
-        "watchlist must be an array.",
+      alert:
+        false,
 
-    }, 400);
+      duplicate:
+        false,
+
+    };
+  }
+
+
+  const fingerprint =
+    await announcementFingerprint(
+      item
+    );
+
+
+  /*
+   * Already seen during the duplicate
+   * retention period.
+   */
+  if (
+    await hasFingerprint(
+      env,
+      fingerprint
+    )
+  ) {
+
+    return {
+
+      matched:
+        true,
+
+      alert:
+        false,
+
+      duplicate:
+        true,
+
+      fingerprint,
+
+    };
   }
 
 
   /*
-   * Clean the watchlist slightly
-   * before saving.
+   * Mark it as seen BEFORE creating
+   * the alert.
+   *
+   * This prevents duplicate processing
+   * if the cron runs again immediately.
    */
-  const cleaned =
-    watchlist
-      .map(
-        item => {
-
-          if (
-            typeof item ===
-            "string"
-          ) {
-
-            return {
-              scrip:
-                item.trim(),
-            };
-          }
-
-
-          return {
-
-            scrip:
-              String(
-                item?.scrip ||
-                ""
-              ).trim(),
-
-            name:
-              String(
-                item?.name ||
-                ""
-              ).trim(),
-          };
-        }
-      )
-      .filter(
-        item =>
-          item.scrip ||
-          item.name
-      );
-
-
-  await setWatchlist(
+  await rememberFingerprint(
     env,
-    cleaned
+    fingerprint
   );
 
 
-  return json({
-
-    ok:
-      true,
-
-    count:
-      cleaned.length,
-
-    watchlist:
-      cleaned,
-  });
-}
-
-
-/* ============================================================
-   ALERTS / SPECIAL BUNDLE
-   ============================================================ */
-
-async function handleAlerts(
-  env
-) {
-
-  const alerts =
-    await getAlerts(
-      env
+  const result =
+    await createAlert(
+      env,
+      item
     );
 
 
-  return json({
+  return {
 
-    ok:
+    matched:
       true,
 
-    bundle:
-      "Alerts / Special Bundle",
+    alert:
+      !!result.created,
 
-    count:
-      alerts.length,
+    duplicate:
+      !!result.duplicate,
 
-    items:
-      alerts,
-  });
+    fingerprint,
+
+    result,
+
+  };
 }
 
 
 /* ============================================================
-   CLEAR ALERTS
+   MONITOR STATE
    ============================================================ */
 
-async function handleAlertsClear(
-  request,
+async function getMonitorState(
   env
 ) {
 
   if (
-    request.method !==
-    "POST"
+    !env.BSE_KV
   ) {
 
-    return json({
-
-      ok:
-        false,
-
-      error:
-        "POST required.",
-
-    }, 405);
+    return null;
   }
 
 
-  await saveAlerts(
+  return await env.BSE_KV.get(
+    MONITOR_STATE_KEY,
+    "json"
+  );
+}
+
+
+/* ============================================================
+   SAVE MONITOR STATE
+   ============================================================ */
+
+async function saveMonitorState(
+  env,
+  state
+) {
+
+  if (
+    !env.BSE_KV
+  ) {
+
+    return;
+  }
+
+
+  await env.BSE_KV.put(
+
+    MONITOR_STATE_KEY,
+
+    JSON.stringify(
+      state
+    )
+  );
+}
+
+
+/* ============================================================
+   BUILD ITEM BASELINE
+   ============================================================ */
+
+async function buildBaseline(
+  items
+) {
+
+  const fingerprints =
+    [];
+
+
+  for (
+    const item of items
+  ) {
+
+    fingerprints.push(
+      await announcementFingerprint(
+        item
+      )
+    );
+  }
+
+
+  return fingerprints;
+}
+
+
+/* ============================================================
+   INITIAL MONITOR BASELINE
+   ============================================================ */
+
+async function initializeMonitor(
+  env,
+  items
+) {
+
+  const fingerprints =
+    await buildBaseline(
+      items
+    );
+
+
+  const state = {
+
+    initialized:
+      true,
+
+    initializedAt:
+      new Date()
+        .toISOString(),
+
+    count:
+      items.length,
+
+    fingerprints,
+
+  };
+
+
+  await saveMonitorState(
     env,
-    []
+    state
   );
 
 
-  return json({
+  /*
+   * Also mark the current items as seen.
+   *
+   * This is critical:
+   * existing BSE announcements will NOT
+   * generate alerts immediately after
+   * the new Worker is deployed.
+   */
+  for (
+    const fingerprint
+      of fingerprints
+  ) {
 
-    ok:
-      true,
+    await rememberFingerprint(
+      env,
+      fingerprint
+    );
+  }
 
-    message:
-      "Alerts / Special Bundle cleared.",
-  });
+
+  return state;
 }
 
 
 /* ============================================================
-   ROOT / HEALTH
+   MONITOR RESULT OBJECT
    ============================================================ */
 
-async function handleRoot(
-  env
-) {
+function emptyMonitorResult() {
 
-  const watchlist =
-    await getWatchlist(
-      env
-    );
-
-
-  return json({
+  return {
 
     ok:
       true,
 
-    app:
-      "BSE RSS Reader",
+    initialized:
+      false,
 
-    version:
-      "V4-Improved-Categories-Alerts",
+    checked:
+      0,
 
-    status:
-      "running",
+    newItems:
+      0,
 
+    whitelistMatches:
+      0,
 
-    feeds: [
-      "Financial Results",
-      "Corporate Announcements",
-    ],
+    alertsCreated:
+      0,
 
+    duplicates:
+      0,
 
-    virtualCategoryFeeds:
-      true,
+    errors:
+      [],
 
+    timestamp:
+      new Date()
+        .toISOString(),
 
-    monitoring:
-      "Every minute",
-
-
-    watchlistCount:
-      watchlist.length,
-
-
-    endpoints: [
-
-      "/",
-
-      "/bse-results",
-
-      "/bse-announcements",
-
-      "/bse-announcements?category=Financial%20Results",
-
-      "/categories",
-
-      "/feeds",
-
-      "/watchlist",
-
-      "/alerts",
-
-      "/alerts/clear",
-
-      "/monitor",
-    ],
-  });
+  };
 }
 
-
-/* ============================================================
-   MAIN FETCH HANDLER
-   ============================================================ */
-
-export default {
-
-  async fetch(
-    request,
-    env,
-    ctx
-  ) {
-
-    const url =
-      new URL(
-        request.url
-      );
-
-
-    /* --------------------------------------------------------
-       CORS PREFLIGHT
-       -------------------------------------------------------- */
-
-    if (
-      request.method ===
-      "OPTIONS"
-    ) {
-
-      return new Response(
-        null,
-        {
-          headers:
-            CORS_HEADERS,
-        }
-      );
-    }
-
-
-    /* --------------------------------------------------------
-       ROOT
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/"
-    ) {
-
-      return handleRoot(
-        env
-      );
-    }
-
-
-    /* --------------------------------------------------------
-       FINANCIAL RESULTS
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/bse-results"
-    ) {
-
-      return handleFinancialResults();
-    }
-
-
-    /* --------------------------------------------------------
-       CORPORATE ANNOUNCEMENTS
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/bse-announcements"
-    ) {
-
-      return handleAnnouncements(
-        request
-      );
-    }
-
-
-    /* --------------------------------------------------------
-       CATEGORIES
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/categories"
-    ) {
-
-      return handleCategories();
-    }
-
-
-    /* --------------------------------------------------------
-       COMBINED FEEDS
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/feeds"
-    ) {
-
-      return handleFeeds();
-    }
-
-
-    /* --------------------------------------------------------
-       WATCHLIST GET
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/watchlist" &&
-      request.method ===
-      "GET"
-    ) {
-
-      return handleWatchlistGet(
-        env
-      );
-    }
-
-
-    /* --------------------------------------------------------
-       WATCHLIST POST
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/watchlist" &&
-      request.method ===
-      "POST"
-    ) {
-
-      return handleWatchlistPost(
-        request,
-        env
-      );
-    }
-
-
-    /* --------------------------------------------------------
-       ALERTS
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/alerts" &&
-      request.method ===
-      "GET"
-    ) {
-
-      return handleAlerts(
-        env
-      );
-    }
-
-
-    /* --------------------------------------------------------
-       CLEAR ALERTS
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/alerts/clear" &&
-      request.method ===
-      "POST"
-    ) {
-
-      return handleAlertsClear(
-        request,
-        env
-      );
-    }
-
-
-    /* --------------------------------------------------------
-       MANUAL MONITOR
-       -------------------------------------------------------- */
-
-    if (
-      url.pathname ===
-      "/monitor"
-    ) {
-
-      const result =
-        await monitorFeeds(
-          env
-        );
-
-
-      return json({
-
-        ok:
-          true,
-
-        ...result,
-      });
-    }
-
-
-    /* --------------------------------------------------------
-       UNKNOWN ENDPOINT
-       -------------------------------------------------------- */
-
-    return json({
-
-      ok:
-        false,
-
-      error:
-        "Endpoint not found.",
-
-    }, 404);
-  },
-
-
-  /* ==========================================================
-     CLOUDFLARE CRON
-     ========================================================== */
-
-  async scheduled(
-    event,
-    env,
-    ctx
-  ) {
-
-    /*
-     * Cloudflare Cron should be configured
-     * to run every minute:
-     *
-     *   * * * *
-     */
-
-    ctx.waitUntil(
-      monitorFeeds(
-        env
-      )
-    );
-  },
-};
 
