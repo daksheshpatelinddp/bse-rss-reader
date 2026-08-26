@@ -2445,22 +2445,26 @@ async function handleRequest(
       path
     }, 404);
 
-  } catch (error) {
+} catch (error) {
 
-    console.error(
-      "Worker error:",
+  console.error(
+    "Worker error:",
+    error
+  );
+
+  return json({
+    ok: false,
+    error: String(
+      error?.message ||
       error
-    );
-
-    return json({
-      ok: false,
-      error:
-        String(
-          error?.message ||
-          error
-        )
-    }, 500);
-  }
+    ),
+    stack: String(
+      error?.stack ||
+      ""
+    )
+  }, 500);
+}
+  
 }
 
 
