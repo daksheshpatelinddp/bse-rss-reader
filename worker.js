@@ -39,7 +39,7 @@ const INDIA_TIME_ZONE =
   "Asia/Kolkata";
 
 const BSC_DATA_BINDING =
-  "BSC_DATA";
+  "BSE_DATA";
 
 /*
  * Number of announcements per KV chunk.
@@ -225,15 +225,16 @@ function alertKey(fingerprint) {
    KV CHECK
    ========================================================= */
 
-function requireKV(env) {
-  if (!env.BSC_DATA) {
-    throw new Error(
-      "BSC_DATA KV binding is missing."
-    );
-  }
-
-  return env.BSC_DATA;
+function requireKV(env)
+  if (!env.BSE_DATA) {
+  throw new Error(
+    "BSE_DATA KV binding is missing."
+  );
 }
+
+return env.BSE_DATA;
+}
+
 
 
 /* =========================================================
