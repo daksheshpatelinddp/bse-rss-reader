@@ -226,6 +226,7 @@ function alertKey(fingerprint) {
    ========================================================= */
 
 function requireKV(env)
+{
   if (!env.BSE_DATA) {
   throw new Error(
     "BSE_DATA KV binding is missing."
