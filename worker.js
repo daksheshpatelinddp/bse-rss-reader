@@ -2588,6 +2588,130 @@ async function handleRequest(
         env
       );
     }
+    
+    
+    
+    
+    if (path === "/test-alert") {
+
+  try {
+
+    const watchlist =
+      await getWatchlist(env);
+
+    if (
+      !Array.isArray(watchlist) ||
+      watchlist.length === 0
+    ) {
+
+      return json({
+        ok: false,
+        error:
+          "Watchlist is empty. Add a BSE scrip first."
+      }, 400);
+
+    }
+
+    const watch =
+      watchlist[0];
+
+    const testItem = {
+
+      id:
+        "TEST-" +
+        Date.now(),
+
+      scrip:
+        watch.scrip || "",
+
+      company:
+        watch.name ||
+        "TEST COMPANY",
+
+      title:
+        "TEST ALERT - BSE Reader",
+
+      description:
+        "This is a test alert for the whitelisted scrip.",
+
+      category:
+        "Financial Results",
+
+      categories: [
+        "Financial Results"
+      ],
+
+      pubDate:
+        new Date().toISOString(),
+
+      link:
+        "https://www.bseindia.com/"
+
+    };
+
+
+    const created =
+      await createAlert(
+        env,
+        testItem
+      );
+
+
+    return json({
+
+      ok: true,
+
+      test: true,
+
+      created:
+
+        created,
+
+      scrip:
+        testItem.scrip,
+
+      company:
+        testItem.company,
+
+      message:
+        created
+          ? "Test alert created."
+          : "Test alert already exists."
+
+    });
+
+  } catch (error) {
+
+    return json({
+
+      ok: false,
+
+      error:
+        String(
+          error?.message ||
+          error
+        ),
+
+      stack:
+        String(
+          error?.stack ||
+          ""
+        )
+
+    }, 500);
+
+  }
+
+}
+
+
+
+
+
+    
+    
+    
+    
 
     if (
       path ===
