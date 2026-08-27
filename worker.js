@@ -2649,6 +2649,14 @@ async function handleRequest(
 
     };
 
+   testItem.guid =
+  "TEST-" +
+  Date.now();
+
+testItem.fingerprint =
+  await fingerprintFor(
+    testItem
+  );
 
     const created =
       await createAlert(
