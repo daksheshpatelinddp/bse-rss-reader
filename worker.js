@@ -1,6 +1,7 @@
 /**
  * BSE Announcement & Result Reader Worker
- * Fully handles "BSE 501111", "501111", "Infosys (500209)", and plain names.
+ * Complete implementation supporting bulk stock additions, file uploads, 
+ * flexible watchlist matching, and real-time ntfy.sh alerts.
  */
 
 const FEED_URLS = {
@@ -34,10 +35,35 @@ export default {
           const watchlist = await getWatchlist(env);
           return jsonResponse(watchlist);
         }
+
         if (request.method === "POST") {
-          const body = await request.json();
-          await saveWatchlist(env, body);
-          return jsonResponse({ ok: true, watchlist: body });
+          let newEntries = [];
+          const contentType = request.headers.get("content-type") || "";
+
+          // 1. Handle plain text / CSV file upload or multiline/comma raw string
+          if (contentType.includes("text/plain") || contentType.includes("text/csv")) {
+            const text = await request.text();
+            newEntries = text.split(/[\n,\r]+/).map((s) => s.trim()).filter(Boolean);
+          } else {
+            // 2. Handle JSON array or comma-separated payload
+            const body = await request.json();
+            if (Array.isArray(body)) {
+              newEntries = body;
+            } else if (typeof body === "string") {
+              newEntries = body.split(",").map((s) => s.trim()).filter(Boolean);
+            } else if (body.watchlist) {
+              newEntries = Array.isArray(body.watchlist)
+                ? body.watchlist
+                : String(body.watchlist).split(",").map((s) => s.trim()).filter(Boolean);
+            }
+          }
+
+          // Clean, merge, and deduplicate entries
+          const existing = await getWatchlist(env);
+          const combined = Array.from(new Set([...existing, ...newEntries]));
+
+          await saveWatchlist(env, combined);
+          return jsonResponse({ ok: true, watchlist: combined });
         }
       }
 
@@ -124,8 +150,8 @@ async function monitorFeeds(env) {
 }
 
 /**
- * Enhanced Watchlist Matcher
- * Automatically cleans prefixes like "BSE " and extracts 6-digit scrips
+ * Enhanced Multi-Format Matcher
+ * Handles: "501111", "BSE 501111", "Infosys (500209)", "500209 (Infosys)", or plain names.
  */
 function matchesWatchlist(item, watchlist) {
   if (!watchlist || !Array.isArray(watchlist) || watchlist.length === 0) return false;
@@ -142,7 +168,7 @@ function matchesWatchlist(item, watchlist) {
 
     if (!cleanVal) return false;
 
-    // 1. Extract 6-digit scrip code regardless of prefixes like "BSE "
+    // 1. Extract and match 6-digit scrip code regardless of prefixes like "BSE "
     const scripMatch = cleanVal.match(/\b\d{6}\b/);
     if (scripMatch) {
       const extractedScrip = scripMatch[0];
@@ -159,7 +185,7 @@ function matchesWatchlist(item, watchlist) {
       .replace(/[^a-z0-9\s]/g, "")
       .trim();
 
-    // 3. Perform string matching on company name
+    // 3. Perform string match on cleaned company name
     if (nameOnly.length >= 3) {
       if (itemTitle.includes(nameOnly) || itemCompany.includes(nameOnly)) {
         return true;
@@ -178,7 +204,7 @@ async function sendWebPush(item) {
   const targetUrl = item.pdfUrl || item.link || `https://www.bseindia.com/stock-share-price/-/${item.scrip}/`;
   const payload = {
     topic: NTFY_TOPIC,
-    title: `🚨 ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
+    title: ` ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
     message: item.title,
     click: targetUrl,
     priority: 4,
