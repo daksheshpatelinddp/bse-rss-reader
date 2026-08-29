@@ -1,7 +1,6 @@
 /**
  * BSE Announcement & Result Reader Worker
- * Fully handles bulk stock additions, file uploads, CORS preflight,
- * flexible watchlist matching, and ntfy.sh alerts.
+ * Complete Backend Script
  */
 
 const FEED_URLS = {
@@ -26,7 +25,7 @@ const CATEGORY_RULES = {
 
 export default {
   async fetch(request, env, ctx) {
-    // Handle CORS preflight OPTIONS requests to prevent "Failed to fetch"
+    // 1. Handle CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -39,7 +38,8 @@ export default {
     }
 
     const url = new URL(request.url);
-    const path = url.pathname;
+    // Normalize path to strip trailing slashes
+    const path = url.pathname.replace(/\/$/, "") || "/";
 
     try {
       if (path === "/watchlist") {
@@ -105,7 +105,7 @@ export default {
         return jsonResponse({ ok: true, cleared: true });
       }
 
-      return jsonResponse({ ok: false, error: "Endpoint not found." }, 404);
+      return jsonResponse({ ok: false, error: `Route ${path} not found.` }, 404);
     } catch (err) {
       return jsonResponse({ ok: false, error: err.message }, 500);
     }
@@ -165,10 +165,6 @@ async function monitorFeeds(env) {
   };
 }
 
-/**
- * Enhanced Multi-Format Matcher
- * Handles: "501111", "BSE 501111", "Infosys (500209)", "500209 (Infosys)", or plain names.
- */
 function matchesWatchlist(item, watchlist) {
   if (!watchlist || !Array.isArray(watchlist) || watchlist.length === 0) return false;
 
@@ -184,7 +180,7 @@ function matchesWatchlist(item, watchlist) {
 
     if (!cleanVal) return false;
 
-    // 1. Extract 6-digit scrip code regardless of prefixes like "BSE "
+    // 1. Extract 6-digit scrip code
     const scripMatch = cleanVal.match(/\b\d{6}\b/);
     if (scripMatch) {
       const extractedScrip = scripMatch[0];
@@ -193,7 +189,7 @@ function matchesWatchlist(item, watchlist) {
       }
     }
 
-    // 2. Clean text entries: strip scrip numbers, parentheses, and prefixes like "bse"
+    // 2. Clean text entries
     const nameOnly = cleanVal
       .replace(/\(\d{6}\)/g, "")
       .replace(/\b\d{6}\b/g, "")
@@ -201,7 +197,7 @@ function matchesWatchlist(item, watchlist) {
       .replace(/[^a-z0-9\s]/g, "")
       .trim();
 
-    // 3. Perform string match on cleaned company name
+    // 3. Match cleaned company name
     if (nameOnly.length >= 3) {
       if (itemTitle.includes(nameOnly) || itemCompany.includes(nameOnly)) {
         return true;
@@ -220,7 +216,7 @@ async function sendWebPush(item) {
   const targetUrl = item.pdfUrl || item.link || `https://www.bseindia.com/stock-share-price/-/${item.scrip}/`;
   const payload = {
     topic: NTFY_TOPIC,
-    title: ` ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
+    title: `🚨 ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
     message: item.title,
     click: targetUrl,
     priority: 4,
