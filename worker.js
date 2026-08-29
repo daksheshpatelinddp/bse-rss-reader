@@ -1,7 +1,7 @@
 /**
  * BSE Announcement & Result Reader Worker
- * Complete implementation supporting bulk stock additions, file uploads, 
- * flexible watchlist matching, CORS preflight handling, and real-time ntfy.sh alerts.
+ * Fully handles bulk stock additions, file uploads, CORS preflight,
+ * flexible watchlist matching, and ntfy.sh alerts.
  */
 
 const FEED_URLS = {
@@ -26,7 +26,7 @@ const CATEGORY_RULES = {
 
 export default {
   async fetch(request, env, ctx) {
-    // Handle CORS preflight OPTIONS requests to prevent "Failed to fetch" errors
+    // Handle CORS preflight OPTIONS requests to prevent "Failed to fetch"
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -50,31 +50,28 @@ export default {
 
         if (request.method === "POST") {
           let newEntries = [];
-          const contentType = request.headers.get("content-type") || "";
 
           try {
-            // Handle plain text / CSV file upload or multiline/comma raw string
-            if (contentType.includes("text/plain") || contentType.includes("text/csv")) {
-              const text = await request.text();
-              newEntries = text.split(/[\n,\r]+/).map((s) => s.trim()).filter(Boolean);
-            } else {
-              // Handle JSON payload (Arrays, Objects, or Comma-separated strings)
+            const contentType = request.headers.get("content-type") || "";
+
+            if (contentType.includes("application/json")) {
               const body = await request.json();
               if (Array.isArray(body)) {
                 newEntries = body;
               } else if (typeof body === "string") {
-                newEntries = body.split(",").map((s) => s.trim()).filter(Boolean);
+                newEntries = body.split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
               } else if (body && typeof body === "object") {
-                const target = body.watchlist || body.company || body.scrip || body.text || "";
+                const target = body.watchlist || body.company || body.scrip || "";
                 newEntries = Array.isArray(target)
                   ? target
-                  : String(target).split(",").map((s) => s.trim()).filter(Boolean);
+                  : String(target).split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
               }
+            } else {
+              const text = await request.text();
+              newEntries = text.split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
             }
-          } catch (e) {
-            // Fallback for unparsed raw text bodies
-            const rawText = await request.text();
-            newEntries = rawText.split(/[\n,\r]+/).map((s) => s.trim()).filter(Boolean);
+          } catch (err) {
+            newEntries = [];
           }
 
           // Clean, merge, and deduplicate entries
@@ -187,7 +184,7 @@ function matchesWatchlist(item, watchlist) {
 
     if (!cleanVal) return false;
 
-    // 1. Extract and match 6-digit scrip code regardless of prefixes like "BSE "
+    // 1. Extract 6-digit scrip code regardless of prefixes like "BSE "
     const scripMatch = cleanVal.match(/\b\d{6}\b/);
     if (scripMatch) {
       const extractedScrip = scripMatch[0];
@@ -223,7 +220,7 @@ async function sendWebPush(item) {
   const targetUrl = item.pdfUrl || item.link || `https://www.bseindia.com/stock-share-price/-/${item.scrip}/`;
   const payload = {
     topic: NTFY_TOPIC,
-    title: `🚨 ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
+    title: ` ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
     message: item.title,
     click: targetUrl,
     priority: 4,
