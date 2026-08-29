@@ -1,135 +1,415 @@
-/* ============================================================
-   BSE ANNOUNCEMENT READER - WORKER.JS (BACKEND)
-   ============================================================ */
+/*
+ * BSE RSS READER
+ * V4 - Improved BSE Corporate Announcement Categories
+ *       + Watchlist Alerts / Special Bundle + Push Notifications
+ *
+ * KV binding: BSE_DATA
+ */
 
-const corsHeaders = {
+const FINANCIAL_RESULTS_URL =
+  "https://beta.bseindia.com/Data/XML/FinancialResultsFeed.xml";
+
+const CORPORATE_ANNOUNCEMENTS_URL =
+  "https://beta.bseindia.com/data/xml/announcements.xml";
+
+const MAX_SEEN = 10000;
+const MAX_ALERTS = 1000;
+
+const NTFY_TOPIC = "bse_alerts_dakshesh_532";
+
+const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-export default {
-  async fetch(request, env) {
-    // Handle CORS preflight requests
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
-    }
+/* ============================================================
+   HELPERS & UTILS
+   ============================================================ */
 
-    const url = new URL(request.url);
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...CORS_HEADERS,
+    },
+  });
+}
 
-    try {
-      // ------------------------------------------------------------
-      // 1. WATCHLIST ENDPOINT (/watchlist)
-      // ------------------------------------------------------------
-      if (url.pathname === "/watchlist") {
-        if (request.method === "POST") {
-          const body = await request.json();
-          const watchlist = Array.isArray(body.watchlist) ? body.watchlist : [];
-          const jsonString = JSON.stringify(watchlist);
+async function sendWebPush(title, body, scrip) {
+  try {
+    const clickUrl = scrip
+      ? `https://www.bseindia.com/stock-share-price/${scrip}`
+      : "https://www.bseindia.com";
 
-          // Save to KV or R2 depending on your binding setup
-          if (env.WATCHLIST_KV) {
-            await env.WATCHLIST_KV.put("watchlist", jsonString);
-          } else if (env.BUCKET) {
-            await env.BUCKET.put("watchlist.json", jsonString);
-          }
-
-          return new Response(JSON.stringify({ watchlist }), {
-            headers: { ...corsHeaders, "Content-Type": "application/json" }
-          });
-        }
-
-        // GET Request: Retrieve saved watchlist
-        let rawData = null;
-        if (env.WATCHLIST_KV) {
-          rawData = await env.WATCHLIST_KV.get("watchlist");
-        } else if (env.BUCKET) {
-          const object = await env.BUCKET.get("watchlist.json");
-          if (object) rawData = await object.text();
-        }
-
-        const watchlist = rawData ? JSON.parse(rawData) : [];
-        return new Response(JSON.stringify({ watchlist }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" }
-        });
-      }
-
-      // ------------------------------------------------------------
-      // 2. BSE RSS FEED ENDPOINT (/rss)
-      // ------------------------------------------------------------
-      if (url.pathname === "/rss") {
-        const bseRssUrl = "https://www.bseindia.com/data/xml/CorporateAnnouncement.xml";
-        
-        const bseResponse = await fetch(bseRssUrl, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-          }
-        });
-
-        if (!bseResponse.ok) {
-          return new Response(JSON.stringify({ items: [], error: "Failed to fetch BSE feed" }), {
-            status: 502,
-            headers: { ...corsHeaders, "Content-Type": "application/json" }
-          });
-        }
-
-        const xmlText = await bseResponse.text();
-        const items = parseBseXml(xmlText);
-
-        return new Response(JSON.stringify({ items }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" }
-        });
-      }
-
-      // 404 Fallback
-      return new Response("Not Found", { status: 404, headers: corsHeaders });
-
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" }
-      });
-    }
+    await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
+      method: "POST",
+      headers: {
+        Title: title,
+        Tags: "chart_with_upwards_trend,bell",
+        Priority: "high",
+        Click: clickUrl,
+      },
+      body: body,
+    });
+  } catch (err) {
+    console.error("Failed to send push notification:", err);
   }
-};
+}
+
+function decodeHtml(value) {
+  return String(value || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#039;/gi, "'")
+    .replace(/&#39;/gi, "'")
+    .replace(/&nbsp;/gi, " ");
+}
+
+function stripHtml(value) {
+  return decodeHtml(value)
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function xmlTag(xml, tag) {
+  const regex = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i");
+  const match = xml.match(regex);
+  return match ? stripHtml(match[1]) : "";
+}
+
+async function fetchXML(url) {
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/4.0)",
+      Accept: "application/rss+xml, application/xml, text/xml, */*",
+      "Cache-Control": "no-cache",
+    },
+    cf: { cacheTtl: 0, cacheEverything: false },
+  });
+
+  if (!response.ok) {
+    throw new Error(`BSE feed HTTP ${response.status}`);
+  }
+  return await response.text();
+}
 
 /* ============================================================
-   XML PARSER HELPER FOR BSE ANNOUNCEMENTS
+   CLASSIFICATION RULES
    ============================================================ */
-function parseBseXml(xml) {
+
+const CATEGORY_RULES = [
+  {
+    name: "Financial Results",
+    words: [
+      "financial results", "financial result", "unaudited financial results",
+      "audited financial results", "quarterly results", "quarterly result",
+      "results for the quarter", "standalone financial results", "consolidated financial results"
+    ],
+  },
+  {
+    name: "Board Meeting",
+    words: ["board meeting", "meeting of the board", "outcome of board meeting"],
+  },
+  {
+    name: "Dividend",
+    words: ["dividend", "interim dividend", "final dividend", "special dividend"],
+  },
+  {
+    name: "Bonus",
+    words: ["bonus issue", "bonus shares", "issue of bonus shares"],
+  },
+  {
+    name: "Fund Raising",
+    words: ["fund raising", "fundraising", "qip", "private placement", "preferential issue"],
+  },
+  {
+    name: "Acquisition",
+    words: ["acquisition", "acquire", "acquired", "takeover"],
+  },
+  {
+    name: "Order / Contract",
+    words: ["order received", "order win", "work order", "contract awarded"],
+  },
+  {
+    name: "Credit Rating",
+    words: ["credit rating", "rating reaffirmed", "rating upgrade", "rating downgrade"],
+  },
+  {
+    name: "Appointment / Resignation",
+    words: ["appointment", "resignation", "cessation", "change in management"],
+  }
+];
+
+function classifyAnnouncement(title, description) {
+  const text = `${title || ""} ${description || ""}`.toLowerCase().replace(/\s+/g, " ").trim();
+  const categories = [];
+
+  for (const rule of CATEGORY_RULES) {
+    if (rule.words.some(word => text.includes(word))) {
+      categories.push(rule.name);
+    }
+  }
+
+  if (categories.length === 0) categories.push("Other");
+  const isFinancialResult = categories.includes("Financial Results");
+
+  return { category: categories[0], categories, isFinancialResult };
+}
+
+/* ============================================================
+   PARSERS
+   ============================================================ */
+
+function parseFinancialResults(xml) {
   const items = [];
-  const itemMatches = xml.match(/<item>([\s\S]*?)<\/item>/gi) || [];
+  const matches = xml.match(/<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi) || [];
 
-  itemMatches.forEach((itemXml) => {
-    const getTag = (tag) => {
-      const match = itemXml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
-      return match ? match[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim() : "";
-    };
+  for (const itemXML of matches) {
+    const title = xmlTag(itemXML, "title");
+    const link = xmlTag(itemXML, "link");
+    const description = xmlTag(itemXML, "description");
+    const pubDate = xmlTag(itemXML, "pubDate") || new Date().toUTCString();
 
-    const title = getTag("title");
-    const description = getTag("description");
-    const link = getTag("link");
-    const pubDate = getTag("pubDate");
-    const category = getTag("category") || "General";
+    if (!title) continue;
 
-    // Extract Scrip Code (6 digits) and Company Name from title/description
-    const scripMatch = (title + " " + description).match(/\b(\d{6})\b/);
-    const scrip = scripMatch ? scripMatch[1] : "";
+    let company = title;
+    let scrip = "";
 
-    // Extract company name prior to scrip or brackets
-    let company = title.split("-")[0] || title.split("(")[0] || "BSE Listed Company";
-    company = company.trim();
+    const titleMatch = title.match(/^(.*?)\s*\((\d+)\)\s*$/);
+    if (titleMatch) {
+      company = titleMatch[1].trim();
+      scrip = titleMatch[2].trim();
+    }
+
+    const stableId = link || `${title}|${description}`;
 
     items.push({
-      title,
-      description,
-      link,
-      pubDate,
-      category,
+      feed: "Financial Results",
+      company,
       scrip,
-      company
+      category: "Financial Results",
+      categories: ["Financial Results"],
+      isFinancialResult: true,
+      title,
+      link,
+      description,
+      pubDate,
+      guid: stableId,
+      id: stableId,
     });
-  });
+  }
 
   return items;
 }
+
+function parseCorporateAnnouncements(xml) {
+  const items = [];
+  const matches = xml.match(/<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi) || [];
+
+  for (const itemXML of matches) {
+    const title = xmlTag(itemXML, "title");
+    const link = xmlTag(itemXML, "link");
+    const description = xmlTag(itemXML, "description");
+    const pubDate = xmlTag(itemXML, "pubDate") || new Date().toUTCString();
+    const guid = xmlTag(itemXML, "guid");
+
+    if (!title && !description) continue;
+
+    let company = "";
+    let scrip = "";
+
+    const titleMatch = title.match(/^(.*?)\s*\((\d{6})\)/);
+    if (titleMatch) {
+      company = titleMatch[1].trim();
+      scrip = titleMatch[2].trim();
+    }
+
+    if (!scrip) {
+      const scripMatch = `${title} ${description}`.match(/\b(\d{6})\b/);
+      if (scripMatch) scrip = scripMatch[1];
+    }
+
+    const classification = classifyAnnouncement(title, description);
+    const stableId = guid || link || `${title}|${description}|${pubDate}`;
+
+    items.push({
+      feed: "Corporate Announcements",
+      company: company || "Unknown Company",
+      scrip,
+      category: classification.category,
+      categories: classification.categories,
+      isFinancialResult: classification.isFinancialResult,
+      title,
+      link,
+      description,
+      pubDate,
+      guid: stableId,
+      id: stableId,
+    });
+  }
+
+  return items;
+}
+
+/* ============================================================
+   KV STORAGE OPERATIONS
+   ============================================================ */
+
+async function getWatchlist(env) {
+  if (!env.BSE_DATA) return [];
+  const data = await env.BSE_DATA.get("watchlist", "json");
+  return Array.isArray(data) ? data : [];
+}
+
+async function setWatchlist(env, watchlist) {
+  if (!env.BSE_DATA) throw new Error("BSE_DATA KV is not bound.");
+  await env.BSE_DATA.put("watchlist", JSON.stringify(watchlist));
+}
+
+async function getSeen(env) {
+  if (!env.BSE_DATA) return [];
+  const data = await env.BSE_DATA.get("announcementSeen", "json");
+  return Array.isArray(data) ? data : [];
+}
+
+async function saveSeen(env, ids) {
+  if (!env.BSE_DATA) return;
+  await env.BSE_DATA.put("announcementSeen", JSON.stringify(ids.slice(0, MAX_SEEN)));
+}
+
+async function getAlerts(env) {
+  if (!env.BSE_DATA) return [];
+  const data = await env.BSE_DATA.get("specialAlerts", "json");
+  return Array.isArray(data) ? data : [];
+}
+
+async function saveAlerts(env, alerts) {
+  if (!env.BSE_DATA) return;
+  await env.BSE_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
+}
+
+function matchesWatchlist(item, watchlist) {
+  if (!Array.isArray(watchlist) || watchlist.length === 0) return false;
+  return watchlist.some(watch => {
+    if (watch.scrip && item.scrip && String(watch.scrip).trim() === String(item.scrip).trim()) {
+      return true;
+    }
+    if (watch.name && item.company) {
+      return String(watch.name).trim().toLowerCase() === String(item.company).trim().toLowerCase();
+    }
+    return false;
+  });
+}
+
+/* ============================================================
+   MONITOR CRON WORKER
+   ============================================================ */
+
+async function monitorFeeds(env) {
+  const [finRes, corpAnn] = await Promise.all([
+    fetchXML(FINANCIAL_RESULTS_URL).then(parseFinancialResults).catch(() => []),
+    fetchXML(CORPORATE_ANNOUNCEMENTS_URL).then(parseCorporateAnnouncements).catch(() => []),
+  ]);
+
+  const items = [...finRes, ...corpAnn];
+  const watchlist = await getWatchlist(env);
+  const seen = await getSeen(env);
+  const alerts = await getAlerts(env);
+
+  if (seen.length === 0) {
+    const ids = items.map(item => item.id).filter(Boolean);
+    await saveSeen(env, ids);
+    return { status: "initialized baseline", count: items.length };
+  }
+
+  const seenSet = new Set(seen);
+  const newItems = items.filter(item => item.id && !seenSet.has(item.id));
+  let newAlertCount = 0;
+
+  for (const item of newItems) {
+    if (matchesWatchlist(item, watchlist)) {
+      if (!alerts.some(a => a.id === item.id)) {
+        await sendWebPush(
+          `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
+          item.title || "New Announcement",
+          item.scrip
+        );
+
+        alerts.unshift({
+          ...item,
+          alert: true,
+          alertCreatedAt: new Date().toISOString(),
+        });
+        newAlertCount++;
+      }
+    }
+  }
+
+  const updatedSeen = Array.from(new Set([...newItems.map(i => i.id), ...seen])).slice(0, MAX_SEEN);
+  await saveSeen(env, updatedSeen);
+  await saveAlerts(env, alerts);
+
+  return { ok: true, newAnnouncements: newItems.length, newAlerts: newAlertCount };
+}
+
+/* ============================================================
+   ROUTER & EXPORTS
+   ============================================================ */
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
+
+    try {
+      if (url.pathname === "/") return json({ status: "running", app: "BSE RSS Reader" });
+
+      if (url.pathname === "/bse-announcements") {
+        const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
+        const items = parseCorporateAnnouncements(xml);
+        return json({ ok: true, count: items.length, items });
+      }
+
+      if (url.pathname === "/categories") {
+        const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
+        const items = parseCorporateAnnouncements(xml);
+        const map = new Map();
+        items.forEach(i => i.categories.forEach(c => map.set(c, (map.get(c) || 0) + 1)));
+        const categories = Array.from(map.entries()).map(([name, count]) => ({ name, count }));
+        return json({ ok: true, categories });
+      }
+
+      if (url.pathname === "/watchlist") {
+        if (request.method === "GET") return json({ ok: true, watchlist: await getWatchlist(env) });
+        if (request.method === "POST") {
+          const body = await request.json();
+          await setWatchlist(env, body.watchlist || []);
+          return json({ ok: true, watchlist: body.watchlist });
+        }
+      }
+
+      if (url.pathname === "/alerts") {
+        return json({ ok: true, items: await getAlerts(env) });
+      }
+
+      if (url.pathname === "/monitor") {
+        const res = await monitorFeeds(env);
+        return json(res);
+      }
+
+      return json({ error: "Not found" }, 404);
+    } catch (err) {
+      return json({ error: err.message }, 500);
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(monitorFeeds(env));
+  },
+};
