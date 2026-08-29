@@ -1,6 +1,6 @@
 /**
- * BSE Announcement & Result Reader Worker
- * Guarantees /watchlist route matching regardless of Cloudflare routing environment
+ * BSE Announcement & Result Reader Worker (Backend)
+ * Project: bse-rss-reader
  */
 
 const FEED_URLS = {
@@ -24,7 +24,7 @@ const CATEGORY_RULES = {
 };
 
 async function handleRequest(request, env) {
-  // 1. Handle CORS Preflight
+  // CORS Preflight
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -40,7 +40,7 @@ async function handleRequest(request, env) {
   const pathname = url.pathname.toLowerCase();
 
   try {
-    // Flexible path matching to prevent sub-route 404 errors
+    // Watchlist Routes
     if (pathname.includes("/watchlist") || pathname.includes("/whitelist")) {
       if (request.method === "GET") {
         const watchlist = await getWatchlist(env);
@@ -51,27 +51,27 @@ async function handleRequest(request, env) {
         let newEntries = [];
 
         try {
-          const contentType = request.headers.get("content-type") || "";
-
-          if (contentType.includes("application/json")) {
-            const body = await request.json();
-            if (Array.isArray(body)) {
-              newEntries = body;
-            } else if (typeof body === "string") {
-              newEntries = body.split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
-            } else if (body && typeof body === "object") {
-              const target = body.watchlist || body.company || body.scrip || "";
-              newEntries = Array.isArray(target)
-                ? target
-                : String(target).split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
+          const rawText = await request.text();
+          if (rawText) {
+            try {
+              const body = JSON.parse(rawText);
+              if (Array.isArray(body)) {
+                newEntries = body;
+              } else if (typeof body === "string" || typeof body === "number") {
+                newEntries = [String(body)];
+              } else if (typeof body === "object" && body !== null) {
+                const target = body.watchlist || body.company || body.scrip || "";
+                newEntries = Array.isArray(target) ? target : [String(target)];
+              }
+            } catch (e) {
+              newEntries = rawText.split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
             }
-          } else {
-            const text = await request.text();
-            newEntries = text.split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
           }
         } catch (err) {
           newEntries = [];
         }
+
+        newEntries = newEntries.map((item) => String(item).trim()).filter(Boolean);
 
         const existing = await getWatchlist(env);
         const combined = Array.from(new Set([...existing, ...newEntries]));
@@ -103,18 +103,12 @@ async function handleRequest(request, env) {
       return jsonResponse(result);
     }
 
-    // Static Asset Fallback (for Cloudflare Pages/Assets)
-    if (request.method === "GET" && env && env.ASSETS) {
-      return await env.ASSETS.fetch(request);
-    }
-
     return jsonResponse({ ok: false, error: `Route ${pathname} not found.` }, 404);
   } catch (err) {
     return jsonResponse({ ok: false, error: err.message }, 500);
   }
 }
 
-// Module Export Syntax
 export default {
   async fetch(request, env, ctx) {
     return handleRequest(request, env);
@@ -124,10 +118,7 @@ export default {
   },
 };
 
-// ==========================================
-// CORE MONITORING & MATCHING LOGIC
-// ==========================================
-
+// Monitoring & Feed Logic
 async function monitorFeeds(env) {
   const items = await fetchFeeds();
   const watchlist = await getWatchlist(env);
@@ -184,7 +175,7 @@ function matchesWatchlist(item, watchlist) {
     if (!watch) return false;
 
     const rawVal = typeof watch === "string" ? watch : watch.scrip || watch.name || "";
-    const cleanVal = rawVal.trim().toLowerCase();
+    const cleanVal = String(rawVal).trim().toLowerCase();
 
     if (!cleanVal) return false;
 
@@ -217,7 +208,7 @@ async function sendWebPush(item) {
   const targetUrl = item.pdfUrl || item.link || `https://www.bseindia.com/stock-share-price/-/${item.scrip}/`;
   const payload = {
     topic: NTFY_TOPIC,
-    title: `🚨 ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
+    title: ` ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
     message: item.title,
     click: targetUrl,
     priority: 4,
