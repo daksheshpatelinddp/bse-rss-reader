@@ -1,6 +1,6 @@
 /**
  * BSE Announcement & Result Reader Worker
- * Single-file solution serving both API endpoints and the Frontend UI.
+ * Guarantees /watchlist route matching regardless of Cloudflare routing environment
  */
 
 const FEED_URLS = {
@@ -23,103 +23,102 @@ const CATEGORY_RULES = {
   "Fund Raising": ["fund raise", "qip", "bonds", "debentures"],
 };
 
+async function handleRequest(request, env) {
+  // 1. Handle CORS Preflight
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      },
+    });
+  }
+
+  const url = new URL(request.url);
+  const pathname = url.pathname.toLowerCase();
+
+  try {
+    // Flexible path matching to prevent sub-route 404 errors
+    if (pathname.includes("/watchlist") || pathname.includes("/whitelist")) {
+      if (request.method === "GET") {
+        const watchlist = await getWatchlist(env);
+        return jsonResponse(watchlist);
+      }
+
+      if (request.method === "POST") {
+        let newEntries = [];
+
+        try {
+          const contentType = request.headers.get("content-type") || "";
+
+          if (contentType.includes("application/json")) {
+            const body = await request.json();
+            if (Array.isArray(body)) {
+              newEntries = body;
+            } else if (typeof body === "string") {
+              newEntries = body.split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
+            } else if (body && typeof body === "object") {
+              const target = body.watchlist || body.company || body.scrip || "";
+              newEntries = Array.isArray(target)
+                ? target
+                : String(target).split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
+            }
+          } else {
+            const text = await request.text();
+            newEntries = text.split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
+          }
+        } catch (err) {
+          newEntries = [];
+        }
+
+        const existing = await getWatchlist(env);
+        const combined = Array.from(new Set([...existing, ...newEntries]));
+
+        await saveWatchlist(env, combined);
+        return jsonResponse({ ok: true, watchlist: combined });
+      }
+    }
+
+    if (pathname.includes("/feeds") || pathname.includes("/bse-announcements")) {
+      const data = await fetchFeeds();
+      const watchlist = await getWatchlist(env);
+      const annotated = annotateWatchlist(data, watchlist);
+      return jsonResponse(annotated);
+    }
+
+    if (pathname.includes("/alerts/clear")) {
+      await saveAlerts(env, []);
+      return jsonResponse({ ok: true, cleared: true });
+    }
+
+    if (pathname.includes("/alerts")) {
+      const alerts = await getAlerts(env);
+      return jsonResponse(alerts);
+    }
+
+    if (pathname.includes("/monitor")) {
+      const result = await monitorFeeds(env);
+      return jsonResponse(result);
+    }
+
+    // Static Asset Fallback (for Cloudflare Pages/Assets)
+    if (request.method === "GET" && env && env.ASSETS) {
+      return await env.ASSETS.fetch(request);
+    }
+
+    return jsonResponse({ ok: false, error: `Route ${pathname} not found.` }, 404);
+  } catch (err) {
+    return jsonResponse({ ok: false, error: err.message }, 500);
+  }
+}
+
+// Module Export Syntax
 export default {
   async fetch(request, env, ctx) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
-        },
-      });
-    }
-
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/$/, "") || "/";
-
-    try {
-      // 1. API Endpoint: Watchlist GET & POST
-      if (path === "/watchlist") {
-        if (request.method === "GET") {
-          const watchlist = await getWatchlist(env);
-          return jsonResponse(watchlist);
-        }
-
-        if (request.method === "POST") {
-          let newEntries = [];
-
-          try {
-            const contentType = request.headers.get("content-type") || "";
-
-            if (contentType.includes("application/json")) {
-              const body = await request.json();
-              if (Array.isArray(body)) {
-                newEntries = body;
-              } else if (typeof body === "string") {
-                newEntries = body.split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
-              } else if (body && typeof body === "object") {
-                const target = body.watchlist || body.company || body.scrip || "";
-                newEntries = Array.isArray(target)
-                  ? target
-                  : String(target).split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
-              }
-            } else {
-              const text = await request.text();
-              newEntries = text.split(/[\n,\r\t]+/).map((s) => s.trim()).filter(Boolean);
-            }
-          } catch (err) {
-            newEntries = [];
-          }
-
-          const existing = await getWatchlist(env);
-          const combined = Array.from(new Set([...existing, ...newEntries]));
-
-          await saveWatchlist(env, combined);
-          return jsonResponse({ ok: true, watchlist: combined });
-        }
-      }
-
-      // 2. API Endpoint: Fetch Announcements / Results Feeds
-      if (path === "/feeds" || path === "/bse-announcements") {
-        const data = await fetchFeeds();
-        const watchlist = await getWatchlist(env);
-        const annotated = annotateWatchlist(data, watchlist);
-        return jsonResponse(annotated);
-      }
-
-      // 3. API Endpoint: Active Alerts
-      if (path === "/alerts") {
-        const alerts = await getAlerts(env);
-        return jsonResponse(alerts);
-      }
-
-      // 4. API Endpoint: Trigger Manual Monitoring Run
-      if (path === "/monitor") {
-        const result = await monitorFeeds(env);
-        return jsonResponse(result);
-      }
-
-      // 5. API Endpoint: Clear Alerts
-      if (path === "/alerts/clear") {
-        await saveAlerts(env, []);
-        return jsonResponse({ ok: true, cleared: true });
-      }
-
-      // 6. Frontend Fallback: If hitting root or unknown non-API route, attempt to serve assets
-      if (request.method === "GET") {
-        if (typeof env.ASSETS !== "undefined") {
-          return await env.ASSETS.fetch(request);
-        }
-      }
-
-      return jsonResponse({ ok: false, error: `Route ${path} not found.` }, 404);
-    } catch (err) {
-      return jsonResponse({ ok: false, error: err.message }, 500);
-    }
+    return handleRequest(request, env);
   },
-
   async scheduled(event, env, ctx) {
     ctx.waitUntil(monitorFeeds(env));
   },
@@ -189,7 +188,6 @@ function matchesWatchlist(item, watchlist) {
 
     if (!cleanVal) return false;
 
-    // Match 6-digit BSE Scrip Code
     const scripMatch = cleanVal.match(/\b\d{6}\b/);
     if (scripMatch) {
       const extractedScrip = scripMatch[0];
@@ -198,7 +196,6 @@ function matchesWatchlist(item, watchlist) {
       }
     }
 
-    // Match Cleaned Company Name
     const nameOnly = cleanVal
       .replace(/\(\d{6}\)/g, "")
       .replace(/\b\d{6}\b/g, "")
@@ -216,15 +213,11 @@ function matchesWatchlist(item, watchlist) {
   });
 }
 
-// ==========================================
-// PUSH NOTIFICATION (NTFY.SH)
-// ==========================================
-
 async function sendWebPush(item) {
   const targetUrl = item.pdfUrl || item.link || `https://www.bseindia.com/stock-share-price/-/${item.scrip}/`;
   const payload = {
     topic: NTFY_TOPIC,
-    title: ` ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
+    title: `🚨 ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
     message: item.title,
     click: targetUrl,
     priority: 4,
@@ -238,10 +231,6 @@ async function sendWebPush(item) {
   });
 }
 
-// ==========================================
-// RSS FETCHING & PARSING
-// ==========================================
-
 async function fetchFeeds() {
   const items = [];
   for (const [type, url] of Object.entries(FEED_URLS)) {
@@ -252,9 +241,7 @@ async function fetchFeeds() {
         const parsed = parseBSEXml(xml, type);
         items.push(...parsed);
       }
-    } catch (e) {
-      // Continue if network fails
-    }
+    } catch (e) {}
   }
   return items;
 }
@@ -315,34 +302,36 @@ function extractTag(xml, tag) {
   return match ? match[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim() : "";
 }
 
-// ==========================================
-// KV STORAGE HELPERS
-// ==========================================
-
 async function getWatchlist(env) {
+  if (!env || !env.BSE_DATA) return [];
   const data = await env.BSE_DATA.get("watchlist", "json");
   return data || [];
 }
 
 async function saveWatchlist(env, watchlist) {
+  if (!env || !env.BSE_DATA) return;
   await env.BSE_DATA.put("watchlist", JSON.stringify(watchlist));
 }
 
 async function getSeen(env) {
+  if (!env || !env.BSE_DATA) return [];
   const data = await env.BSE_DATA.get("announcementSeen", "json");
   return data || [];
 }
 
 async function saveSeen(env, seen) {
+  if (!env || !env.BSE_DATA) return;
   await env.BSE_DATA.put("announcementSeen", JSON.stringify(seen));
 }
 
 async function getAlerts(env) {
+  if (!env || !env.BSE_DATA) return [];
   const data = await env.BSE_DATA.get("alerts", "json");
   return data || [];
 }
 
 async function saveAlerts(env, alerts) {
+  if (!env || !env.BSE_DATA) return;
   await env.BSE_DATA.put("alerts", JSON.stringify(alerts));
 }
 
