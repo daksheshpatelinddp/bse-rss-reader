@@ -1,6 +1,6 @@
 /**
  * BSE Announcement & Result Reader Worker
- * Complete Backend Script
+ * Single-file solution serving both API endpoints and the Frontend UI.
  */
 
 const FEED_URLS = {
@@ -25,7 +25,6 @@ const CATEGORY_RULES = {
 
 export default {
   async fetch(request, env, ctx) {
-    // 1. Handle CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -38,10 +37,10 @@ export default {
     }
 
     const url = new URL(request.url);
-    // Normalize path to strip trailing slashes
     const path = url.pathname.replace(/\/$/, "") || "/";
 
     try {
+      // 1. API Endpoint: Watchlist GET & POST
       if (path === "/watchlist") {
         if (request.method === "GET") {
           const watchlist = await getWatchlist(env);
@@ -74,7 +73,6 @@ export default {
             newEntries = [];
           }
 
-          // Clean, merge, and deduplicate entries
           const existing = await getWatchlist(env);
           const combined = Array.from(new Set([...existing, ...newEntries]));
 
@@ -83,6 +81,7 @@ export default {
         }
       }
 
+      // 2. API Endpoint: Fetch Announcements / Results Feeds
       if (path === "/feeds" || path === "/bse-announcements") {
         const data = await fetchFeeds();
         const watchlist = await getWatchlist(env);
@@ -90,19 +89,29 @@ export default {
         return jsonResponse(annotated);
       }
 
+      // 3. API Endpoint: Active Alerts
       if (path === "/alerts") {
         const alerts = await getAlerts(env);
         return jsonResponse(alerts);
       }
 
+      // 4. API Endpoint: Trigger Manual Monitoring Run
       if (path === "/monitor") {
         const result = await monitorFeeds(env);
         return jsonResponse(result);
       }
 
+      // 5. API Endpoint: Clear Alerts
       if (path === "/alerts/clear") {
         await saveAlerts(env, []);
         return jsonResponse({ ok: true, cleared: true });
+      }
+
+      // 6. Frontend Fallback: If hitting root or unknown non-API route, attempt to serve assets
+      if (request.method === "GET") {
+        if (typeof env.ASSETS !== "undefined") {
+          return await env.ASSETS.fetch(request);
+        }
       }
 
       return jsonResponse({ ok: false, error: `Route ${path} not found.` }, 404);
@@ -180,7 +189,7 @@ function matchesWatchlist(item, watchlist) {
 
     if (!cleanVal) return false;
 
-    // 1. Extract 6-digit scrip code
+    // Match 6-digit BSE Scrip Code
     const scripMatch = cleanVal.match(/\b\d{6}\b/);
     if (scripMatch) {
       const extractedScrip = scripMatch[0];
@@ -189,7 +198,7 @@ function matchesWatchlist(item, watchlist) {
       }
     }
 
-    // 2. Clean text entries
+    // Match Cleaned Company Name
     const nameOnly = cleanVal
       .replace(/\(\d{6}\)/g, "")
       .replace(/\b\d{6}\b/g, "")
@@ -197,7 +206,6 @@ function matchesWatchlist(item, watchlist) {
       .replace(/[^a-z0-9\s]/g, "")
       .trim();
 
-    // 3. Match cleaned company name
     if (nameOnly.length >= 3) {
       if (itemTitle.includes(nameOnly) || itemCompany.includes(nameOnly)) {
         return true;
@@ -216,7 +224,7 @@ async function sendWebPush(item) {
   const targetUrl = item.pdfUrl || item.link || `https://www.bseindia.com/stock-share-price/-/${item.scrip}/`;
   const payload = {
     topic: NTFY_TOPIC,
-    title: `🚨 ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
+    title: ` ${item.company || "BSE Alert"} (${item.scrip || "N/A"})`,
     message: item.title,
     click: targetUrl,
     priority: 4,
@@ -245,7 +253,7 @@ async function fetchFeeds() {
         items.push(...parsed);
       }
     } catch (e) {
-      // Continue if one feed fails
+      // Continue if network fails
     }
   }
   return items;
