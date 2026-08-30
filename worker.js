@@ -1,9 +1,3 @@
-/*
- * BSE RSS READER - WORKER BACKEND
- * Features: XML RSS Parser, Classification Engine, KV Storage Engine,
- * and Smart Sequential Alerting (Telegram Primary -> ntfy Fallback).
- */
-
 const FINANCIAL_RESULTS_URL =
   "https://beta.bseindia.com/Data/XML/FinancialResultsFeed.xml";
 
@@ -19,10 +13,6 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-/* ============================================================
-   HELPERS & UTILS
-   ============================================================ */
-
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -31,6 +21,37 @@ function json(data, status = 200) {
       ...CORS_HEADERS,
     },
   });
+}
+
+async function sendTelegramAlert(title, body, scrip, attachmentUrl, env) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    console.error("Telegram credentials missing in Worker environment variables.");
+    return;
+  }
+
+  // Use direct Attachment PDF link if available
+  const pdfLink = attachmentUrl || (scrip ? `https://www.bseindia.com/markets/equity/EQReports/StockPricedefault.aspx?scripcode=${scrip}` : "https://www.bseindia.com");
+
+  const cleanTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const cleanBody = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n📄 <a href="${pdfLink}">Open Full Attachment PDF</a>`;
+
+  try {
+    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: env.TELEGRAM_CHAT_ID,
+        text: messageText,
+        parse_mode: "HTML",
+        disable_web_page_preview: false,
+      }),
+    });
+  } catch (err) {
+    console.error("Failed to send Telegram alert:", err);
+  }
 }
 
 function decodeHtml(value) {
@@ -57,6 +78,25 @@ function xmlTag(xml, tag) {
   return match ? stripHtml(match[1]) : "";
 }
 
+function extractPdfUrl(itemXML, link, description) {
+  // Extract direct BSE Live attachment PDF
+  const attachTag = xmlTag(itemXML, "ATTACHMENTNAME") || xmlTag(itemXML, "ATTACHMENT") || xmlTag(itemXML, "Fld_AttachName");
+  
+  if (attachTag && attachTag.trim()) {
+    const cleanFile = attachTag.trim();
+    if (cleanFile.toLowerCase().startsWith("http")) return cleanFile;
+    return `https://www.bseindia.com/xml-data/corpfiling/AttachLive/${cleanFile}`;
+  }
+
+  if (link && link.toLowerCase().endsWith(".pdf")) return link;
+
+  // Extract embedded PDF URLs from HTML description nodes
+  const descPdfMatch = (description || "").match(/https?:\/\/[^\s"<>]+\.pdf/i);
+  if (descPdfMatch) return descPdfMatch[0];
+
+  return "";
+}
+
 async function fetchXML(url) {
   const response = await fetch(url, {
     method: "GET",
@@ -74,86 +114,47 @@ async function fetchXML(url) {
   return await response.text();
 }
 
-/* ============================================================
-   SMART ALERT ENGINE
-   ============================================================ */
-
-async function sendTelegramAlert(title, body, scrip, env) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return false;
-
-  const link = scrip
-    ? `https://www.bseindia.com/stock-share-price/${scrip}`
-    : "https://www.bseindia.com";
-
-  const cleanTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const cleanBody = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n🔗 <a href="${link}">View on BSE India</a>`;
-
-  try {
-    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: env.TELEGRAM_CHAT_ID,
-        text: messageText,
-        parse_mode: "HTML",
-        disable_web_page_preview: false,
-      }),
-    });
-
-    return res.ok;
-  } catch (err) {
-    return false;
-  }
-}
-
-async function sendNtfyAlert(title, body, scrip, env) {
-  if (!env.NTFY_TOPIC) return false;
-
-  const link = scrip
-    ? `https://www.bseindia.com/stock-share-price/${scrip}`
-    : "https://www.bseindia.com";
-
-  try {
-    const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
-      method: "POST",
-      headers: {
-        "Title": title,
-        "Priority": "high",
-        "Tags": "warning,chart_with_upwards_trend",
-        "Click": link,
-      },
-      body: body,
-    });
-    return res.ok;
-  } catch (err) {
-    return false;
-  }
-}
-
-async function dispatchAlertWithFallback(title, body, scrip, env) {
-  const telegramSuccess = await sendTelegramAlert(title, body, scrip, env);
-  if (!telegramSuccess) {
-    await sendNtfyAlert(title, body, scrip, env);
-  }
-}
-
-/* ============================================================
-   CLASSIFICATION RULES
-   ============================================================ */
-
 const CATEGORY_RULES = [
-  { name: "Financial Results", words: ["financial results", "financial result", "unaudited financial results", "audited financial results", "quarterly results", "quarterly result", "results for the quarter", "standalone financial results", "consolidated financial results"] },
-  { name: "Board Meeting", words: ["board meeting", "meeting of the board", "outcome of board meeting"] },
-  { name: "Dividend", words: ["dividend", "interim dividend", "final dividend", "special dividend"] },
-  { name: "Bonus", words: ["bonus issue", "bonus shares", "issue of bonus shares"] },
-  { name: "Fund Raising", words: ["fund raising", "fundraising", "qip", "private placement", "preferential issue"] },
-  { name: "Acquisition", words: ["acquisition", "acquire", "acquired", "takeover"] },
-  { name: "Order / Contract", words: ["order received", "order win", "work order", "contract awarded"] },
-  { name: "Credit Rating", words: ["credit rating", "rating reaffirmed", "rating upgrade", "rating downgrade"] },
-  { name: "Appointment / Resignation", words: ["appointment", "resignation", "cessation", "change in management"] }
+  {
+    name: "Financial Results",
+    words: [
+      "financial results", "financial result", "unaudited financial results",
+      "audited financial results", "quarterly results", "quarterly result",
+      "results for the quarter", "standalone financial results", "consolidated financial results"
+    ],
+  },
+  {
+    name: "Board Meeting",
+    words: ["board meeting", "meeting of the board", "outcome of board meeting"],
+  },
+  {
+    name: "Dividend",
+    words: ["dividend", "interim dividend", "final dividend", "special dividend"],
+  },
+  {
+    name: "Bonus",
+    words: ["bonus issue", "bonus shares", "issue of bonus shares"],
+  },
+  {
+    name: "Fund Raising",
+    words: ["fund raising", "fundraising", "qip", "private placement", "preferential issue"],
+  },
+  {
+    name: "Acquisition",
+    words: ["acquisition", "acquire", "acquired", "takeover"],
+  },
+  {
+    name: "Order / Contract",
+    words: ["order received", "order win", "work order", "contract awarded"],
+  },
+  {
+    name: "Credit Rating",
+    words: ["credit rating", "rating reaffirmed", "rating upgrade", "rating downgrade"],
+  },
+  {
+    name: "Appointment / Resignation",
+    words: ["appointment", "resignation", "cessation", "change in management"],
+  }
 ];
 
 function classifyAnnouncement(title, description) {
@@ -171,10 +172,6 @@ function classifyAnnouncement(title, description) {
 
   return { category: categories[0], categories, isFinancialResult };
 }
-
-/* ============================================================
-   PARSERS
-   ============================================================ */
 
 function parseFinancialResults(xml) {
   const items = [];
@@ -197,7 +194,8 @@ function parseFinancialResults(xml) {
       scrip = titleMatch[2].trim();
     }
 
-    const stableId = link || `${title}|${description}`;
+    const attachmentUrl = extractPdfUrl(itemXML, link, description);
+    const stableId = attachmentUrl || link || `${title}|${description}`;
 
     items.push({
       feed: "Financial Results",
@@ -208,6 +206,7 @@ function parseFinancialResults(xml) {
       isFinancialResult: true,
       title,
       link,
+      attachmentUrl,
       description,
       pubDate,
       guid: stableId,
@@ -246,7 +245,8 @@ function parseCorporateAnnouncements(xml) {
     }
 
     const classification = classifyAnnouncement(title, description);
-    const stableId = guid || link || `${title}|${description}|${pubDate}`;
+    const attachmentUrl = extractPdfUrl(itemXML, link, description);
+    const stableId = guid || attachmentUrl || link || `${title}|${description}|${pubDate}`;
 
     items.push({
       feed: "Corporate Announcements",
@@ -257,6 +257,7 @@ function parseCorporateAnnouncements(xml) {
       isFinancialResult: classification.isFinancialResult,
       title,
       link,
+      attachmentUrl,
       description,
       pubDate,
       guid: stableId,
@@ -266,10 +267,6 @@ function parseCorporateAnnouncements(xml) {
 
   return items;
 }
-
-/* ============================================================
-   KV STORAGE OPERATIONS
-   ============================================================ */
 
 async function getWatchlist(env) {
   if (!env.BSE_DATA) return [];
@@ -304,16 +301,13 @@ async function saveAlerts(env, alerts) {
   await env.BSE_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
-/* ============================================================
-   MATCHING ENGINE
-   ============================================================ */
-
 function matchesWatchlist(item, watchlist) {
   if (!Array.isArray(watchlist) || watchlist.length === 0) return false;
 
   const itemScripRaw = String(item.scrip || "");
   const itemScripMatch = itemScripRaw.match(/\b(\d{6})\b/);
   const itemScrip = itemScripMatch ? itemScripMatch[1] : itemScripRaw.trim();
+
   const itemCompany = String(item.company || "").toLowerCase().trim();
 
   return watchlist.some(watch => {
@@ -321,24 +315,27 @@ function matchesWatchlist(item, watchlist) {
     const watchScripMatch = watchScripRaw.match(/\b(\d{6})\b/);
     const watchScrip = watchScripMatch ? watchScripMatch[1] : watchScripRaw.trim();
 
-    if (watchScrip && itemScrip && watchScrip === itemScrip) return true;
+    if (watchScrip && itemScrip && watchScrip === itemScrip) {
+      return true;
+    }
 
     const watchNameRaw = String(watch.name || "");
     const watchNameScripMatch = watchNameRaw.match(/\b(\d{6})\b/);
-    if (watchNameScripMatch && itemScrip && watchNameScripMatch[1] === itemScrip) return true;
+    if (watchNameScripMatch && itemScrip && watchNameScripMatch[1] === itemScrip) {
+      return true;
+    }
 
     const watchName = watchNameRaw.toLowerCase().trim();
-    if (watchName && watchName.length >= 3 && itemCompany && itemCompany.includes(watchName)) {
-      return true;
+
+    if (watchName && watchName.length >= 3 && itemCompany) {
+      if (itemCompany.includes(watchName)) {
+        return true;
+      }
     }
 
     return false;
   });
 }
-
-/* ============================================================
-   MONITOR CRON WORKER
-   ============================================================ */
 
 async function monitorFeeds(env) {
   const [finRes, corpAnn] = await Promise.all([
@@ -353,7 +350,7 @@ async function monitorFeeds(env) {
 
   if (seen.length === 0) {
     const ids = items.map(item => item.id).filter(Boolean);
-    if (ids.length > 0) await saveSeen(env, ids);
+    await saveSeen(env, ids);
     return { status: "initialized baseline", count: items.length };
   }
 
@@ -364,10 +361,11 @@ async function monitorFeeds(env) {
   for (const item of newItems) {
     if (matchesWatchlist(item, watchlist)) {
       if (!alerts.some(a => a.id === item.id)) {
-        await dispatchAlertWithFallback(
+        await sendTelegramAlert(
           `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
           item.title || "New Announcement",
           item.scrip,
+          item.attachmentUrl,
           env
         );
 
@@ -381,21 +379,12 @@ async function monitorFeeds(env) {
     }
   }
 
-  if (newItems.length > 0) {
-    const updatedSeen = Array.from(new Set([...newItems.map(i => i.id), ...seen])).slice(0, MAX_SEEN);
-    await saveSeen(env, updatedSeen);
-  }
-
-  if (newAlertCount > 0) {
-    await saveAlerts(env, alerts);
-  }
+  const updatedSeen = Array.from(new Set([...newItems.map(i => i.id), ...seen])).slice(0, MAX_SEEN);
+  await saveSeen(env, updatedSeen);
+  await saveAlerts(env, alerts);
 
   return { ok: true, newAnnouncements: newItems.length, newAlerts: newAlertCount };
 }
-
-/* ============================================================
-   ROUTER & EXPORTS
-   ============================================================ */
 
 export default {
   async fetch(request, env) {
