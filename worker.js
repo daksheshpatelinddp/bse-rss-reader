@@ -1,12 +1,13 @@
 /*
- * BSE RSS READER
- * V4 - Improved BSE Corporate Announcement Categories
- *       + Watchlist Alerts / Special Bundle + Push Notifications via Telegram Bot
+ * BSE RSS READER - WORKER BACKEND
+ * Features: XML RSS Parser, Classification Engine, KV Storage Engine,
+ *           and Smart Sequential Alerting (Telegram Primary -> ntfy Fallback).
  *
  * KV binding: BSE_DATA
  * Secrets required in Cloudflare Worker:
  *   - TELEGRAM_BOT_TOKEN
  *   - TELEGRAM_CHAT_ID
+ *   - NTFY_TOPIC (e.g., bse-alerts-mysecret-key)
  */
 
 const FINANCIAL_RESULTS_URL =
@@ -36,39 +37,6 @@ function json(data, status = 200) {
       ...CORS_HEADERS,
     },
   });
-}
-
-async function sendTelegramAlert(title, body, scrip, env) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
-    console.error("Telegram credentials missing in Worker environment variables.");
-    return;
-  }
-
-  const link = scrip
-    ? `https://www.bseindia.com/stock-share-price/${scrip}`
-    : "https://www.bseindia.com";
-
-  // Escape HTML entities to prevent Telegram API errors on special characters
-  const cleanTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const cleanBody = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n🔗 <a href="${link}">View on BSE India</a>`;
-
-  try {
-    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: env.TELEGRAM_CHAT_ID,
-        text: messageText,
-        parse_mode: "HTML",
-        disable_web_page_preview: false,
-      }),
-    });
-  } catch (err) {
-    console.error("Failed to send Telegram alert:", err);
-  }
 }
 
 function decodeHtml(value) {
@@ -110,6 +78,89 @@ async function fetchXML(url) {
     throw new Error(`BSE feed HTTP ${response.status}`);
   }
   return await response.text();
+}
+
+/* ============================================================
+   SMART ALERT ENGINE (TELEGRAM PRIMARY -> NTFY FALLBACK)
+   ============================================================ */
+
+async function sendTelegramAlert(title, body, scrip, env) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    console.log("Telegram credentials missing in Worker settings.");
+    return false;
+  }
+
+  const link = scrip
+    ? `https://www.bseindia.com/stock-share-price/${scrip}`
+    : "https://www.bseindia.com";
+
+  const cleanTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const cleanBody = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n🔗 <a href="${link}">View on BSE India</a>`;
+
+  try {
+    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: env.TELEGRAM_CHAT_ID,
+        text: messageText,
+        parse_mode: "HTML",
+        disable_web_page_preview: false,
+      }),
+    });
+
+    if (res.ok) {
+      return true; // Successfully delivered via Telegram
+    } else {
+      console.error(`Telegram API error status: ${res.status}`);
+      return false; // Failed or rate limited
+    }
+  } catch (err) {
+    console.error("Failed to reach Telegram API:", err);
+    return false;
+  }
+}
+
+async function sendNtfyAlert(title, body, scrip, env) {
+  if (!env.NTFY_TOPIC) {
+    console.log("ntfy topic missing in Worker settings.");
+    return false;
+  }
+
+  const link = scrip
+    ? `https://www.bseindia.com/stock-share-price/${scrip}`
+    : "https://www.bseindia.com";
+
+  try {
+    const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
+      method: "POST",
+      headers: {
+        "Title": title,
+        "Priority": "high",
+        "Tags": "warning,chart_with_upwards_trend",
+        "Click": link,
+      },
+      body: body,
+    });
+    return res.ok;
+  } catch (err) {
+    console.error("Failed to send ntfy alert:", err);
+    return false;
+  }
+}
+
+async function dispatchAlertWithFallback(title, body, scrip, env) {
+  // Step 1: Attempt sending via Telegram
+  const telegramSuccess = await sendTelegramAlert(title, body, scrip, env);
+
+  // Step 2: Fall back to ntfy ONLY if Telegram failed or was rate limited
+  if (!telegramSuccess) {
+    console.log("Telegram delivery failed or rate-limited. Dispatching fallback alert via ntfy...");
+    await sendNtfyAlert(title, body, scrip, env);
+  }
 }
 
 /* ============================================================
@@ -375,8 +426,8 @@ async function monitorFeeds(env) {
   for (const item of newItems) {
     if (matchesWatchlist(item, watchlist)) {
       if (!alerts.some(a => a.id === item.id)) {
-        // Send alert through Telegram
-        await sendTelegramAlert(
+        // Triggers Telegram primary, falls back to ntfy only if Telegram fails
+        await dispatchAlertWithFallback(
           `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
           item.title || "New Announcement",
           item.scrip,
