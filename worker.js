@@ -294,15 +294,49 @@ async function saveAlerts(env, alerts) {
   await env.BSE_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
+/* ============================================================
+   HYBRID MATCHING ENGINE
+   ============================================================ */
+
 function matchesWatchlist(item, watchlist) {
   if (!Array.isArray(watchlist) || watchlist.length === 0) return false;
+
+  // Extract pure 6-digit scrip code from incoming RSS feed item
+  const itemScripRaw = String(item.scrip || "");
+  const itemScripMatch = itemScripRaw.match(/\b(\d{6})\b/);
+  const itemScrip = itemScripMatch ? itemScripMatch[1] : itemScripRaw.trim();
+
+  const itemCompany = String(item.company || "").toLowerCase().trim();
+
   return watchlist.some(watch => {
-    if (watch.scrip && item.scrip && String(watch.scrip).trim() === String(item.scrip).trim()) {
+    // 1. EXTRACT 6-DIGIT CODE FROM WATCHLIST ITEM
+    // Correctly handles "500325", "Reliance (500325)", "500325 (Reliance)", etc.
+    const watchScripRaw = String(watch.scrip || "");
+    const watchScripMatch = watchScripRaw.match(/\b(\d{6})\b/);
+    const watchScrip = watchScripMatch ? watchScripMatch[1] : watchScripRaw.trim();
+
+    // STRICT EXACT MATCH on 6-digit Scrip Code
+    if (watchScrip && itemScrip && watchScrip === itemScrip) {
       return true;
     }
-    if (watch.name && item.company) {
-      return String(watch.name).trim().toLowerCase() === String(item.company).trim().toLowerCase();
+
+    // 2. CHECK IF WATCH.NAME CONTAINS A 6-DIGIT CODE
+    const watchNameRaw = String(watch.name || "");
+    const watchNameScripMatch = watchNameRaw.match(/\b(\d{6})\b/);
+    if (watchNameScripMatch && itemScrip && watchNameScripMatch[1] === itemScrip) {
+      return true;
     }
+
+    // 3. PARTIAL/CASE-INSENSITIVE MATCH ON COMPANY NAME
+    const watchName = watchNameRaw.toLowerCase().trim();
+
+    // Requires minimum length of 3 chars to prevent accidental noise matches
+    if (watchName && watchName.length >= 3 && itemCompany) {
+      if (itemCompany.includes(watchName)) {
+        return true;
+      }
+    }
+
     return false;
   });
 }
