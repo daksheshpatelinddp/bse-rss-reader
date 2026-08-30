@@ -1,9 +1,12 @@
 /*
  * BSE RSS READER
  * V4 - Improved BSE Corporate Announcement Categories
- *       + Watchlist Alerts / Special Bundle + Push Notifications
+ *       + Watchlist Alerts / Special Bundle + Push Notifications via Telegram Bot
  *
  * KV binding: BSE_DATA
+ * Secrets required in Cloudflare Worker:
+ *   - TELEGRAM_BOT_TOKEN
+ *   - TELEGRAM_CHAT_ID
  */
 
 const FINANCIAL_RESULTS_URL =
@@ -14,8 +17,6 @@ const CORPORATE_ANNOUNCEMENTS_URL =
 
 const MAX_SEEN = 10000;
 const MAX_ALERTS = 1000;
-
-const NTFY_TOPIC = "bse_alerts_dakshesh_532";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -37,24 +38,36 @@ function json(data, status = 200) {
   });
 }
 
-async function sendWebPush(title, body, scrip) {
-  try {
-    const clickUrl = scrip
-      ? `https://www.bseindia.com/stock-share-price/${scrip}`
-      : "https://www.bseindia.com";
+async function sendTelegramAlert(title, body, scrip, env) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    console.error("Telegram credentials missing in Worker environment variables.");
+    return;
+  }
 
-    await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
+  const link = scrip
+    ? `https://www.bseindia.com/stock-share-price/${scrip}`
+    : "https://www.bseindia.com";
+
+  // Escape HTML entities to prevent Telegram API errors on special characters
+  const cleanTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const cleanBody = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n🔗 <a href="${link}">View on BSE India</a>`;
+
+  try {
+    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+    await fetch(url, {
       method: "POST",
-      headers: {
-        Title: title,
-        Tags: "chart_with_upwards_trend,bell",
-        Priority: "high",
-        Click: clickUrl,
-      },
-      body: body,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: env.TELEGRAM_CHAT_ID,
+        text: messageText,
+        parse_mode: "HTML",
+        disable_web_page_preview: false,
+      }),
     });
   } catch (err) {
-    console.error("Failed to send push notification:", err);
+    console.error("Failed to send Telegram alert:", err);
   }
 }
 
@@ -301,7 +314,6 @@ async function saveAlerts(env, alerts) {
 function matchesWatchlist(item, watchlist) {
   if (!Array.isArray(watchlist) || watchlist.length === 0) return false;
 
-  // Extract pure 6-digit scrip code from incoming RSS feed item
   const itemScripRaw = String(item.scrip || "");
   const itemScripMatch = itemScripRaw.match(/\b(\d{6})\b/);
   const itemScrip = itemScripMatch ? itemScripMatch[1] : itemScripRaw.trim();
@@ -309,28 +321,22 @@ function matchesWatchlist(item, watchlist) {
   const itemCompany = String(item.company || "").toLowerCase().trim();
 
   return watchlist.some(watch => {
-    // 1. EXTRACT 6-DIGIT CODE FROM WATCHLIST ITEM
-    // Correctly handles "500325", "Reliance (500325)", "500325 (Reliance)", etc.
     const watchScripRaw = String(watch.scrip || "");
     const watchScripMatch = watchScripRaw.match(/\b(\d{6})\b/);
     const watchScrip = watchScripMatch ? watchScripMatch[1] : watchScripRaw.trim();
 
-    // STRICT EXACT MATCH on 6-digit Scrip Code
     if (watchScrip && itemScrip && watchScrip === itemScrip) {
       return true;
     }
 
-    // 2. CHECK IF WATCH.NAME CONTAINS A 6-DIGIT CODE
     const watchNameRaw = String(watch.name || "");
     const watchNameScripMatch = watchNameRaw.match(/\b(\d{6})\b/);
     if (watchNameScripMatch && itemScrip && watchNameScripMatch[1] === itemScrip) {
       return true;
     }
 
-    // 3. PARTIAL/CASE-INSENSITIVE MATCH ON COMPANY NAME
     const watchName = watchNameRaw.toLowerCase().trim();
 
-    // Requires minimum length of 3 chars to prevent accidental noise matches
     if (watchName && watchName.length >= 3 && itemCompany) {
       if (itemCompany.includes(watchName)) {
         return true;
@@ -369,10 +375,12 @@ async function monitorFeeds(env) {
   for (const item of newItems) {
     if (matchesWatchlist(item, watchlist)) {
       if (!alerts.some(a => a.id === item.id)) {
-        await sendWebPush(
+        // Send alert through Telegram
+        await sendTelegramAlert(
           `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
           item.title || "New Announcement",
-          item.scrip
+          item.scrip,
+          env
         );
 
         alerts.unshift({
