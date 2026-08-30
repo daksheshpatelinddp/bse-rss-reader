@@ -423,8 +423,9 @@ export default {
         if (request.method === "GET") return json({ ok: true, watchlist: await getWatchlist(env) });
         if (request.method === "POST") {
           const body = await request.json();
-          await setWatchlist(env, body.watchlist || []);
-          return json({ ok: true, watchlist: body.watchlist });
+          const newWatchlist = Array.isArray(body.watchlist) ? body.watchlist : [];
+          await setWatchlist(env, newWatchlist);
+          return json({ ok: true, watchlist: newWatchlist });
         }
       }
 
