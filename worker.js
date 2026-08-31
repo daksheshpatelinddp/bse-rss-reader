@@ -4251,105 +4251,46 @@ async function handleWatchlistPost(
    WATCHLIST DELETE
    ============================================================ */
 
-async function handleWatchlistPost(
+async function handleWatchlistDelete(
   env,
   request
 ) {
 
-  const body =
-    await readJSON(
-      request
+  const scrip =
+    getQuery(
+      request,
+      "scrip"
     );
+
+
+  let code =
+    scrip;
 
 
   /*
-   * Current frontend sends the COMPLETE whitelist:
-   *
-   * {
-   *   watchlist: [
-   *     { scrip: "500325", name: "..." },
-   *     { scrip: "501111", name: "..." }
-   *   ]
-   * }
-   *
-   * Save the complete list in one KV write.
+   * Also accept JSON body.
    */
-  if (
-    body &&
-    Array.isArray(
-      body.watchlist
-    )
-  ) {
 
-    const normalized = [];
+  if (!code) {
 
-    for (
-      const value of body.watchlist
-    ) {
+    const body =
+      await readJSON(
+        request
+      );
 
-      const item =
-        normalizeWatchItem(
-          value
-        );
 
-      if (!item) {
-        continue;
-      }
+    code =
+      body.scrip ||
+      body.scripCode ||
+      "";
 
-      const exists =
-        normalized.some(
-          x =>
-            cleanScrip(
-              x.scrip
-            ) ===
-            item.scrip
-        );
-
-      if (!exists) {
-        normalized.push(
-          item
-        );
-      }
-    }
-
-    await saveWatchlist(
-      env,
-      normalized
-    );
-
-    return json({
-
-      ok:
-        true,
-
-      added:
-        false,
-
-      watchlist:
-        normalized,
-
-      count:
-        normalized.length
-
-    });
   }
 
 
-  /*
-   * Compatibility:
-   * accept a single item too.
-   */
-  const input =
-    body.item ||
-    body.company ||
-    body.scrip ||
-    body;
-
-
   const result =
-    await addWatchlist(
+    await removeWatchlist(
       env,
-      input
+      code
     );
 
 
@@ -4358,11 +4299,8 @@ async function handleWatchlistPost(
     ok:
       true,
 
-    added:
-      result.added,
-
-    item:
-      result.item,
+    removed:
+      result.removed,
 
     watchlist:
       result.watchlist,
@@ -4373,6 +4311,7 @@ async function handleWatchlistPost(
   });
 
 }
+
 
 /* ============================================================
    ALERTS ENDPOINT
