@@ -4261,17 +4261,18 @@ async function handleWatchlistPost(
       request
     );
 
+
   /*
-   * Frontend sends the complete whitelist:
+   * Current frontend sends the COMPLETE whitelist:
    *
    * {
    *   watchlist: [
-   *     { scrip: "500325" },
-   *     { scrip: "501111" }
+   *     { scrip: "500325", name: "..." },
+   *     { scrip: "501111", name: "..." }
    *   ]
    * }
    *
-   * Accept that format first.
+   * Save the complete list in one KV write.
    */
   if (
     body &&
@@ -4291,9 +4292,7 @@ async function handleWatchlistPost(
           value
         );
 
-      if (
-        !item
-      ) {
+      if (!item) {
         continue;
       }
 
@@ -4306,9 +4305,7 @@ async function handleWatchlistPost(
             item.scrip
         );
 
-      if (
-        !exists
-      ) {
+      if (!exists) {
         normalized.push(
           item
         );
@@ -4321,6 +4318,7 @@ async function handleWatchlistPost(
     );
 
     return json({
+
       ok:
         true,
 
@@ -4332,13 +4330,14 @@ async function handleWatchlistPost(
 
       count:
         normalized.length
+
     });
   }
 
 
   /*
    * Compatibility:
-   * also accept a single item.
+   * accept a single item too.
    */
   const input =
     body.item ||
@@ -4346,13 +4345,16 @@ async function handleWatchlistPost(
     body.scrip ||
     body;
 
+
   const result =
     await addWatchlist(
       env,
       input
     );
 
+
   return json({
+
     ok:
       true,
 
@@ -4367,9 +4369,10 @@ async function handleWatchlistPost(
 
     count:
       result.watchlist.length
-  });
-}
 
+  });
+
+}
 
 /* ============================================================
    ALERTS ENDPOINT
