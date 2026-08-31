@@ -4251,65 +4251,123 @@ async function handleWatchlistPost(
    WATCHLIST DELETE
    ============================================================ */
 
-async function handleWatchlistDelete(
+async function handleWatchlistPost(
   env,
   request
 ) {
 
-  const scrip =
-    getQuery(
-      request,
-      "scrip"
+  const body =
+    await readJSON(
+      request
     );
 
-
-  let code =
-    scrip;
-
-
   /*
-   * Also accept JSON body.
+   * Frontend sends the complete whitelist:
+   *
+   * {
+   *   watchlist: [
+   *     { scrip: "500325" },
+   *     { scrip: "501111" }
+   *   ]
+   * }
+   *
+   * Accept that format first.
    */
+  if (
+    body &&
+    Array.isArray(
+      body.watchlist
+    )
+  ) {
 
-  if (!code) {
+    const normalized = [];
 
-    const body =
-      await readJSON(
-        request
-      );
+    for (
+      const value of body.watchlist
+    ) {
 
+      const item =
+        normalizeWatchItem(
+          value
+        );
 
-    code =
-      body.scrip ||
-      body.scripCode ||
-      "";
+      if (
+        !item
+      ) {
+        continue;
+      }
 
+      const exists =
+        normalized.some(
+          x =>
+            cleanScrip(
+              x.scrip
+            ) ===
+            item.scrip
+        );
+
+      if (
+        !exists
+      ) {
+        normalized.push(
+          item
+        );
+      }
+    }
+
+    await saveWatchlist(
+      env,
+      normalized
+    );
+
+    return json({
+      ok:
+        true,
+
+      added:
+        false,
+
+      watchlist:
+        normalized,
+
+      count:
+        normalized.length
+    });
   }
 
 
+  /*
+   * Compatibility:
+   * also accept a single item.
+   */
+  const input =
+    body.item ||
+    body.company ||
+    body.scrip ||
+    body;
+
   const result =
-    await removeWatchlist(
+    await addWatchlist(
       env,
-      code
+      input
     );
 
-
   return json({
-
     ok:
       true,
 
-    removed:
-      result.removed,
+    added:
+      result.added,
+
+    item:
+      result.item,
 
     watchlist:
       result.watchlist,
 
     count:
       result.watchlist.length
-
   });
-
 }
 
 
