@@ -1867,6 +1867,8 @@ async function fetchAnnouncements() {
   return result;
 
 }
+
+
 /* ============================================================
    DAILY STORAGE
    ============================================================ */
@@ -2857,10 +2859,6 @@ function watchName(
 
 
 /* ============================================================
-   END PART 2
-   ============================================================ */
-   
-   /* ============================================================
    ALERT STORAGE
    ============================================================ */
 
@@ -2980,6 +2978,103 @@ async function saveAlertIndex(
 
 
   return clean;
+
+}
+
+
+/* ============================================================
+   NOTIFICATION DISPATCH (TELEGRAM & NTFY)
+   ============================================================ */
+
+async function sendNotification(
+  env,
+  alert
+) {
+
+  const message =
+    `⭐ *BSE ALERT*\n` +
+    `*Company:* ${alert.company || "Unknown"} (${alert.scrip || "N/A"})\n` +
+    `*Category:* ${alert.category || "Other"}\n` +
+    `*Title:* ${alert.title || "No Title"}\n` +
+    (alert.link ? `\n[View Announcement](${alert.link})` : "");
+
+
+  /*
+   * TELEGRAM DISPATCH
+   */
+
+  if (
+    env.TELEGRAM_BOT_TOKEN &&
+    env.TELEGRAM_CHAT_ID
+  ) {
+
+    try {
+
+      await fetch(
+        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type": "application/json"
+          },
+
+          body: JSON.stringify({
+            chat_id: env.TELEGRAM_CHAT_ID,
+            text: message,
+            parse_mode: "Markdown",
+            disable_web_page_preview: false
+          })
+        }
+      );
+
+    } catch (e) {
+
+      console.error(
+        "Telegram notification error:",
+        e
+      );
+
+    }
+
+  }
+
+
+  /*
+   * NTFY DISPATCH
+   */
+
+  if (
+    env.NTFY_TOPIC
+  ) {
+
+    try {
+
+      await fetch(
+        `https://ntfy.sh/${env.NTFY_TOPIC}`,
+        {
+          method: "POST",
+
+          headers: {
+            "Title": `${alert.company || "BSE"} (${alert.scrip || "Alert"})`,
+            "Priority": "high",
+            "Tags": "star,chart_with_upwards_trend"
+          },
+
+          body: `${alert.title}\n${alert.link || ""}`
+        }
+      );
+
+    } catch (e) {
+
+      console.error(
+        "ntfy notification error:",
+        e
+      );
+
+    }
+
+  }
 
 }
 
@@ -3118,6 +3213,16 @@ async function createAlert(
         ALERT_TTL
     }
 
+  );
+
+
+  /*
+   * Send external notifications.
+   */
+
+  await sendNotification(
+    env,
+    alert
   );
 
 
@@ -3801,10 +3906,6 @@ async function runMonitor(
 
 
 /* ============================================================
-   END PART 3
-   ============================================================ */
-   
-   /* ============================================================
    GET REQUEST HELPERS
    ============================================================ */
 
@@ -4478,568 +4579,108 @@ async function handleClearAlerts(
 
 
 /* ============================================================
-   TEST ALERT
+   TEST ALERT ENDPOINT
    ============================================================ */
 
 async function handleTestAlert(
   env
 ) {
 
-  const watchlist =
-    await getWatchlist(
-      env
-    );
-
-
-  if (
-    watchlist.length === 0
-  ) {
-
-    return json({
-
-      ok:
-        false,
-
-      error:
-        "Watchlist is empty. Add a BSE scrip first."
-
-    }, 400);
-
-  }
-
-
-  const watch =
-    watchlist[0];
-
-
-  /*
-   * Give the test announcement a
-   * deterministic but unique fingerprint.
-   */
-
-  const testItem = {
-
-    title:
-      "TEST ALERT - BSE Reader",
-
-    description:
-      "Test alert generated for the BSE Reader whitelist.",
-
-    link:
-      "https://www.bseindia.com/",
-
-    guid:
-      "TEST-" +
-      Date.now(),
-
-    pubDate:
-      new Date().toISOString(),
-
-    company:
-      watch.name ||
-      "Test Company",
-
-    scrip:
-      cleanScrip(
-        watch.scrip
-      ),
-
-    category:
-      "Financial Results",
-
-    categories: [
-      "Financial Results"
-    ],
-
-    feed:
-      "Corporate Announcements"
-
+  const mockAlert = {
+    company: "Test Company",
+    scrip: "000000",
+    category: "Test Category",
+    title: "This is a test notification from BSE RSS Reader",
+    link: "https://www.bseindia.com"
   };
 
-
-  testItem.fingerprint =
-    await fingerprintFor(
-      testItem
-    );
-
-
-  /*
-   * createAlert() performs the actual
-   * KV storage.
-   */
-
-  const created =
-    await createAlert(
-      env,
-      testItem,
-      watchlist
-    );
-
-
-  return json({
-
-    ok:
-      true,
-
-    test:
-      true,
-
-    created,
-
-    scrip:
-      testItem.scrip,
-
-    company:
-      testItem.company,
-
-    alertId:
-      testItem.fingerprint,
-
-    message:
-      created
-        ? "Test alert created."
-        : "Test alert already exists."
-
-  });
-
-}
-
-
-/* ============================================================
-   MONITOR ENDPOINT
-   ============================================================ */
-
-async function handleMonitor(
-  env
-) {
-
-  return json(
-    await runMonitor(
-      env
-    )
+  await sendNotification(
+    env,
+    mockAlert
   );
 
-}
-
-
-/* ============================================================
-   HEALTH / STATUS
-   ============================================================ */
-
-async function handleRoot(
-  env
-) {
-
-  const watchlist =
-    await getWatchlist(
-      env
-    );
-
-
-  const day =
-    indiaDate();
-
-
-  const index =
-    await getDayIndex(
-      env,
-      day
-    );
-
-
-  const alerts =
-    await getAlerts(
-      env
-    );
-
-
-  const state =
-    await getMonitorState(
-      env
-    );
-
-
   return json({
-
-    ok:
-      true,
-
-    service:
-      "BSE RSS Reader",
-
-    version:
-      "BSE-DATA-KV-LOW-WRITE",
-
-    date:
-      day,
-
-    announcementsToday:
-      index.count,
-
-    announcementChunks:
-      index.chunks,
-
-    watchlist:
-      watchlist.length,
-
-    alerts:
-      alerts.length,
-
-    monitor:
-      state
-
+    ok: true,
+    message: "Test notification dispatched to configured channels."
   });
 
 }
 
 
 /* ============================================================
-   UNKNOWN ENDPOINT
-   ============================================================ */
-
-function endpointNotFound(
-  path
-) {
-
-  return json({
-
-    ok:
-      false,
-
-    error:
-      "Endpoint not found",
-
-    path
-
-  }, 404);
-
-}
-
-
-/* ============================================================
-   END PART 4
-   ============================================================ */
-   
-   /* ============================================================
-   FINAL FETCH HANDLER
+   FETCH ROUTER
    ============================================================ */
 
 export default {
 
-  async fetch(
-    request,
-    env,
-    ctx
-  ) {
+  async fetch(request, env, ctx) {
+
+    if (request.method === "OPTIONS") {
+
+      return new Response(null, {
+        headers: CORS_HEADERS
+      });
+
+    }
+
+
+    const url =
+      new URL(request.url);
+
+    const path =
+      url.pathname;
+
 
     try {
 
-      const url =
-        new URL(
-          request.url
-        );
-
-      const path =
-        url.pathname;
-
-
-      /* ------------------------------------------------------
-         CORS
-         ------------------------------------------------------ */
-
-      if (
-        request.method ===
-        "OPTIONS"
-      ) {
-
-        return new Response(
-          null,
-          {
-            status: 204,
-
-            headers: {
-              "Access-Control-Allow-Origin":
-                "*",
-
-              "Access-Control-Allow-Methods":
-                "GET,POST,DELETE,OPTIONS",
-
-              "Access-Control-Allow-Headers":
-                "Content-Type"
-            }
-          }
-        );
-
+      if (path === "/" || path === "/bse-announcements") {
+        return await handleBSEAnnouncements(env, request);
       }
 
-
-      /* ------------------------------------------------------
-         ROOT
-         ------------------------------------------------------ */
-
-      if (
-        path === "/" &&
-        request.method === "GET"
-      ) {
-
-        return handleRoot(
-          env
-        );
-
+      if (path === "/categories") {
+        return await handleCategories(env);
       }
 
+      if (path === "/watchlist") {
 
-      /* ------------------------------------------------------
-         BSE ANNOUNCEMENTS
-         ------------------------------------------------------ */
+        if (request.method === "POST") {
+          return await handleWatchlistPost(env, request);
+        }
 
-      if (
-        path === "/bse-announcements" &&
-        request.method === "GET"
-      ) {
+        if (request.method === "DELETE") {
+          return await handleWatchlistDelete(env, request);
+        }
 
-        return handleBSEAnnouncements(
-          env,
-          request
-        );
-
+        return await handleWatchlistGet(env);
       }
 
-
-      /*
-       * Compatibility route.
-       *
-       * This allows the frontend to continue
-       * using /announcements if that was the
-       * previous endpoint.
-       */
-
-      if (
-        path === "/announcements" &&
-        request.method === "GET"
-      ) {
-
-        return handleBSEAnnouncements(
-          env,
-          request
-        );
-
+      if (path === "/alerts") {
+        return await handleAlerts(env, request);
       }
 
-
-      /* ------------------------------------------------------
-         CATEGORIES
-         ------------------------------------------------------ */
-
-      if (
-        path === "/categories" &&
-        request.method === "GET"
-      ) {
-
-        return handleCategories(
-          env
-        );
-
+      if (path === "/alerts/clear") {
+        return await handleClearAlerts(env, request);
       }
 
-
-      /* ------------------------------------------------------
-         WATCHLIST GET
-         ------------------------------------------------------ */
-
-      if (
-        path === "/watchlist" &&
-        request.method === "GET"
-      ) {
-
-        return handleWatchlistGet(
-          env
-        );
-
+      if (path === "/monitor") {
+        const result = await runMonitor(env);
+        return json(result);
       }
 
-
-      /* ------------------------------------------------------
-         WATCHLIST ADD
-         ------------------------------------------------------ */
-
-      if (
-        path === "/watchlist" &&
-        request.method === "POST"
-      ) {
-
-        return handleWatchlistPost(
-          env,
-          request
-        );
-
+      if (path === "/test-alert") {
+        return await handleTestAlert(env);
       }
-
-
-      /* ------------------------------------------------------
-         WATCHLIST DELETE
-         ------------------------------------------------------ */
-
-      if (
-        path === "/watchlist" &&
-        request.method === "DELETE"
-      ) {
-
-        return handleWatchlistDelete(
-          env,
-          request
-        );
-
-      }
-
-
-      /* ------------------------------------------------------
-         ALERTS
-         ------------------------------------------------------ */
-
-      if (
-        path === "/alerts" &&
-        request.method === "GET"
-      ) {
-
-        return handleAlerts(
-          env,
-          request
-        );
-
-      }
-
-
-      /*
-       * Compatibility route for the
-       * Special Bundle.
-       */
-
-      if (
-        path === "/alert-bundle" &&
-        request.method === "GET"
-      ) {
-
-        return handleAlerts(
-          env,
-          request
-        );
-
-      }
-
-
-      /* ------------------------------------------------------
-         CLEAR ALERTS
-         ------------------------------------------------------ */
-
-      if (
-        path === "/alerts/clear" &&
-        request.method === "POST"
-      ) {
-
-        return handleClearAlerts(
-          env,
-          request
-        );
-
-      }
-
-
-      /* ------------------------------------------------------
-         TEST ALERT
-         ------------------------------------------------------ */
-
-      if (
-        path === "/test-alert" &&
-        request.method === "GET"
-      ) {
-
-        return handleTestAlert(
-          env
-        );
-
-      }
-
-
-      if (
-        path === "/test-alert" &&
-        request.method === "POST"
-      ) {
-
-        return handleTestAlert(
-          env
-        );
-
-      }
-
-
-      /* ------------------------------------------------------
-         MONITOR
-         ------------------------------------------------------ */
-
-      if (
-        path === "/monitor" &&
-        request.method === "GET"
-      ) {
-
-        return handleMonitor(
-          env
-        );
-
-      }
-
-
-      /*
-       * Manual POST monitor is also accepted.
-       */
-
-      if (
-        path === "/monitor" &&
-        request.method === "POST"
-      ) {
-
-        return handleMonitor(
-          env
-        );
-
-      }
-
-
-      /* ------------------------------------------------------
-         UNKNOWN ROUTE
-         ------------------------------------------------------ */
-
-      return endpointNotFound(
-        path
-      );
-
-    } catch (
-      error
-    ) {
-
-      console.error(
-        "Worker error:",
-        error
-      );
-
 
       return json({
+        ok: false,
+        error: "Route not found"
+      }, 404);
 
-        ok:
-          false,
+    } catch (error) {
 
-        error:
-          String(
-            error?.message ||
-            error
-          ),
-
-        stack:
-          String(
-            error?.stack ||
-            ""
-          )
-
+      return json({
+        ok: false,
+        error: String(error?.message || error)
       }, 500);
 
     }
@@ -5047,64 +4688,16 @@ export default {
   },
 
 
-  /* ==========================================================
-     CLOUDFLARE SCHEDULED TRIGGER
-     ========================================================== */
+  /* ============================================================
+     CRON TRIGGER HANDLER
+     ============================================================ */
 
-  async scheduled(
-    event,
-    env,
-    ctx
-  ) {
-
-    /*
-     * Cloudflare calls this every minute
-     * when the cron trigger is configured:
-     *
-     *   * * * *
-     *
-     * The monitor runs in the background.
-     */
+  async scheduled(event, env, ctx) {
 
     ctx.waitUntil(
-
-      (async () => {
-
-        try {
-
-          const result =
-            await runMonitor(
-              env
-            );
-
-
-          console.log(
-            "BSE monitor:",
-            JSON.stringify(
-              result
-            )
-          );
-
-        } catch (
-          error
-        ) {
-
-          console.error(
-            "Scheduled monitor error:",
-            error
-          );
-
-        }
-
-      })()
-
+      runMonitor(env)
     );
 
   }
 
 };
-
-
-/* ============================================================
-   END OF WORKER.JS
-   ============================================================ */
