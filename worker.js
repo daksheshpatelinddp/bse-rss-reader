@@ -60,6 +60,13 @@ function normalizeBseLink(rawLink) {
   return clean;
 }
 
+function escapeTelegramHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 async function sendTelegramAlert(title, body, scrip, link, env) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.error("Telegram credentials missing in Worker environment variables.");
@@ -71,9 +78,8 @@ async function sendTelegramAlert(title, body, scrip, link, env) {
     ? pdfLink
     : (scrip ? "https://www.bseindia.com/stock-share-price/" + scrip : "https://www.bseindia.com");
 
-  // Escape HTML entities to prevent Telegram API errors on special characters
-  const cleanTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const cleanBody = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const cleanTitle = escapeTelegramHtml(title);
+  const cleanBody = escapeTelegramHtml(body);
 
   const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n🔗 <a href="${targetLink}">View Attachment / Details</a>`;
 
