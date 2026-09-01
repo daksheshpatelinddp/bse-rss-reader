@@ -38,21 +38,43 @@ function json(data, status = 200) {
   });
 }
 
-async function sendTelegramAlert(title, body, scrip, env) {
+function normalizeBseLink(rawLink) {
+  var clean = String(rawLink || "").trim();
+  if (!clean) return "https://www.bseindia.com";
+
+  if (clean.indexOf("AttachLive") !== -1 || clean.indexOf("AttachHis") !== -1) {
+    var fileName = clean.split("/").pop();
+    if (fileName) {
+      return "https://www.bseindia.com/xml-data/corpfiling/AttachLive/" + fileName;
+    }
+  }
+
+  if (clean.indexOf("http") !== 0) {
+    if (clean.indexOf("/") === 0) {
+      return "https://www.bseindia.com" + clean;
+    }
+    return "https://www.bseindia.com/" + clean;
+  }
+
+  return clean;
+}
+
+async function sendTelegramAlert(title, body, scrip, link, env) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.error("Telegram credentials missing in Worker environment variables.");
     return;
   }
 
-  const link = scrip
-    ? `https://www.bseindia.com/stock-share-price/${scrip}`
-    : "https://www.bseindia.com";
+  var pdfLink = normalizeBseLink(link);
+  var targetLink = (pdfLink && pdfLink !== "https://www.bseindia.com")
+    ? pdfLink
+    : (scrip ? "https://www.bseindia.com/stock-share-price/" + scrip : "https://www.bseindia.com");
 
   // Escape HTML entities to prevent Telegram API errors on special characters
   const cleanTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const cleanBody = body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n🔗 <a href="${link}">View on BSE India</a>`;
+  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n🔗 <a href="${targetLink}">View Attachment / Details</a>`;
 
   try {
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -185,7 +207,8 @@ function parseFinancialResults(xml) {
 
   for (const itemXML of matches) {
     const title = xmlTag(itemXML, "title");
-    const link = xmlTag(itemXML, "link");
+    const rawLink = xmlTag(itemXML, "link");
+    const link = normalizeBseLink(rawLink);
     const description = xmlTag(itemXML, "description");
     const pubDate = xmlTag(itemXML, "pubDate") || new Date().toUTCString();
 
@@ -227,7 +250,8 @@ function parseCorporateAnnouncements(xml) {
 
   for (const itemXML of matches) {
     const title = xmlTag(itemXML, "title");
-    const link = xmlTag(itemXML, "link");
+    const rawLink = xmlTag(itemXML, "link");
+    const link = normalizeBseLink(rawLink);
     const description = xmlTag(itemXML, "description");
     const pubDate = xmlTag(itemXML, "pubDate") || new Date().toUTCString();
     const guid = xmlTag(itemXML, "guid");
@@ -380,6 +404,7 @@ async function monitorFeeds(env) {
           `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
           item.title || "New Announcement",
           item.scrip,
+          item.link,
           env
         );
 
