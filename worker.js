@@ -1,12 +1,13 @@
 /*
  * BSE RSS READER
  * V4 - Improved BSE Corporate Announcement Categories
- *       + Watchlist Alerts / Special Bundle + Push Notifications via Telegram Bot
+ *       + Watchlist Alerts / Special Bundle + Push Notifications via Telegram Bot & ntfy
  *
  * KV binding: BSE_DATA
  * Secrets required in Cloudflare Worker:
  *   - TELEGRAM_BOT_TOKEN
  *   - TELEGRAM_CHAT_ID
+ *   - NTFY_TOPIC
  */
 
 const FINANCIAL_RESULTS_URL =
@@ -90,6 +91,33 @@ async function sendTelegramAlert(title, body, scrip, link, env) {
     });
   } catch (err) {
     console.error("Failed to send Telegram alert:", err);
+  }
+}
+
+async function sendNtfyAlert(title, body, scrip, link, env) {
+  if (!env.NTFY_TOPIC) {
+    console.error("NTFY_TOPIC missing in Worker environment variables.");
+    return;
+  }
+
+  var pdfLink = normalizeBseLink(link);
+  var targetLink = (pdfLink && pdfLink !== "https://www.bseindia.com")
+    ? pdfLink
+    : (scrip ? "https://www.bseindia.com/stock-share-price/" + scrip : "https://www.bseindia.com");
+
+  try {
+    const url = `https://ntfy.sh/${env.NTFY_TOPIC}`;
+    await fetch(url, {
+      method: "POST",
+      headers: {
+        "Title": title,
+        "Click": targetLink,
+        "Tags": "chart_with_upwards_trend,warning"
+      },
+      body: body
+    });
+  } catch (err) {
+    console.error("Failed to send ntfy alert:", err);
   }
 }
 
@@ -309,6 +337,17 @@ async function setWatchlist(env, watchlist) {
   await env.BSE_DATA.put("watchlist", JSON.stringify(watchlist));
 }
 
+async function getNotificationSettings(env) {
+  if (!env.BSE_DATA) return { telegram: true, ntfy: true };
+  const data = await env.BSE_DATA.get("notificationSettings", "json");
+  return data || { telegram: true, ntfy: true };
+}
+
+async function setNotificationSettings(env, settings) {
+  if (!env.BSE_DATA) throw new Error("BSE_DATA KV is not bound.");
+  await env.BSE_DATA.put("notificationSettings", JSON.stringify(settings));
+}
+
 async function getSeen(env) {
   if (!env.BSE_DATA) return [];
   const data = await env.BSE_DATA.get("announcementSeen", "json");
@@ -383,6 +422,7 @@ async function monitorFeeds(env) {
 
   const items = [...finRes, ...corpAnn];
   const watchlist = await getWatchlist(env);
+  const settings = await getNotificationSettings(env);
   const seen = await getSeen(env);
   const alerts = await getAlerts(env);
 
@@ -399,14 +439,28 @@ async function monitorFeeds(env) {
   for (const item of newItems) {
     if (matchesWatchlist(item, watchlist)) {
       if (!alerts.some(a => a.id === item.id)) {
-        // Send alert through Telegram
-        await sendTelegramAlert(
-          `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
-          item.title || "New Announcement",
-          item.scrip,
-          item.link,
-          env
-        );
+
+        // Send Telegram notification if enabled
+        if (settings.telegram !== false) {
+          await sendTelegramAlert(
+            `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
+            item.title || "New Announcement",
+            item.scrip,
+            item.link,
+            env
+          );
+        }
+
+        // Send ntfy notification if enabled
+        if (settings.ntfy !== false) {
+          await sendNtfyAlert(
+            `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
+            item.title || "New Announcement",
+            item.scrip,
+            item.link,
+            env
+          );
+        }
 
         alerts.unshift({
           ...item,
@@ -458,6 +512,17 @@ export default {
           const body = await request.json();
           await setWatchlist(env, body.watchlist || []);
           return json({ ok: true, watchlist: body.watchlist });
+        }
+      }
+
+      if (url.pathname === "/notification-settings") {
+        if (request.method === "GET") {
+          return json({ ok: true, settings: await getNotificationSettings(env) });
+        }
+        if (request.method === "POST") {
+          const body = await request.json();
+          await setNotificationSettings(env, body);
+          return json({ ok: true, settings: body });
         }
       }
 
