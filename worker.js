@@ -67,7 +67,7 @@ function escapeTelegramHtml(text) {
     .replace(/>/g, "&gt;");
 }
 
-async function sendTelegramAlert(title, body, scrip, link, env) {
+async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.error("Telegram credentials missing in Worker environment variables.");
     return;
@@ -80,8 +80,9 @@ async function sendTelegramAlert(title, body, scrip, link, env) {
 
   const cleanTitle = escapeTelegramHtml(title);
   const cleanBody = escapeTelegramHtml(body);
+  const formattedFetchTime = fetchedAt ? new Date(fetchedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) : "N/A";
 
-  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n🔗 <a href="${targetLink}">View Attachment / Details</a>`;
+  const messageText = ` <b>${cleanTitle}</b>\n\n${cleanBody}\n\n <b>Fetched:</b> ${formattedFetchTime}\n <a href="${targetLink}">View Attachment / Details</a>`;
 
   try {
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -100,7 +101,7 @@ async function sendTelegramAlert(title, body, scrip, link, env) {
   }
 }
 
-async function sendNtfyAlert(title, body, scrip, link, env) {
+async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
   if (!env.NTFY_TOPIC) {
     console.error("NTFY_TOPIC missing in Worker environment variables.");
     return;
@@ -111,6 +112,9 @@ async function sendNtfyAlert(title, body, scrip, link, env) {
     ? pdfLink
     : (scrip ? "https://www.bseindia.com/stock-share-price/" + scrip : "https://www.bseindia.com");
 
+  const formattedFetchTime = fetchedAt ? new Date(fetchedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) : "N/A";
+  const messageBody = `${body}\nFetched: ${formattedFetchTime}`;
+
   try {
     const url = `https://ntfy.sh/${env.NTFY_TOPIC}`;
     await fetch(url, {
@@ -120,7 +124,7 @@ async function sendNtfyAlert(title, body, scrip, link, env) {
         "Click": targetLink,
         "Tags": "chart_with_upwards_trend,warning"
       },
-      body: body
+      body: messageBody
     });
   } catch (err) {
     console.error("Failed to send ntfy alert:", err);
@@ -235,7 +239,7 @@ function classifyAnnouncement(title, description) {
    PARSERS
    ============================================================ */
 
-function parseFinancialResults(xml) {
+function parseFinancialResults(xml, fetchedAt) {
   const items = [];
   const matches = xml.match(/<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi) || [];
 
@@ -270,6 +274,7 @@ function parseFinancialResults(xml) {
       link,
       description,
       pubDate,
+      fetchedAt,
       guid: stableId,
       id: stableId,
     });
@@ -278,7 +283,7 @@ function parseFinancialResults(xml) {
   return items;
 }
 
-function parseCorporateAnnouncements(xml) {
+function parseCorporateAnnouncements(xml, fetchedAt) {
   const items = [];
   const matches = xml.match(/<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi) || [];
 
@@ -320,6 +325,7 @@ function parseCorporateAnnouncements(xml) {
       link,
       description,
       pubDate,
+      fetchedAt,
       guid: stableId,
       id: stableId,
     });
@@ -421,9 +427,10 @@ function matchesWatchlist(item, watchlist) {
    ============================================================ */
 
 async function monitorFeeds(env) {
+  const fetchedAt = new Date().toISOString();
   const [finRes, corpAnn] = await Promise.all([
-    fetchXML(FINANCIAL_RESULTS_URL).then(parseFinancialResults).catch(() => []),
-    fetchXML(CORPORATE_ANNOUNCEMENTS_URL).then(parseCorporateAnnouncements).catch(() => []),
+    fetchXML(FINANCIAL_RESULTS_URL).then(xml => parseFinancialResults(xml, fetchedAt)).catch(() => []),
+    fetchXML(CORPORATE_ANNOUNCEMENTS_URL).then(xml => parseCorporateAnnouncements(xml, fetchedAt)).catch(() => []),
   ]);
 
   const items = [...finRes, ...corpAnn];
@@ -453,6 +460,7 @@ async function monitorFeeds(env) {
             item.title || "New Announcement",
             item.scrip,
             item.link,
+            item.fetchedAt,
             env
           );
         }
@@ -464,6 +472,7 @@ async function monitorFeeds(env) {
             item.title || "New Announcement",
             item.scrip,
             item.link,
+            item.fetchedAt,
             env
           );
         }
@@ -498,14 +507,16 @@ export default {
       if (url.pathname === "/") return json({ status: "running", app: "BSE RSS Reader" });
 
       if (url.pathname === "/bse-announcements") {
+        const fetchedAt = new Date().toISOString();
         const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-        const items = parseCorporateAnnouncements(xml);
+        const items = parseCorporateAnnouncements(xml, fetchedAt);
         return json({ ok: true, count: items.length, items });
       }
 
       if (url.pathname === "/categories") {
+        const fetchedAt = new Date().toISOString();
         const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-        const items = parseCorporateAnnouncements(xml);
+        const items = parseCorporateAnnouncements(xml, fetchedAt);
         const map = new Map();
         items.forEach(i => i.categories.forEach(c => map.set(c, (map.get(c) || 0) + 1)));
         const categories = Array.from(map.entries()).map(([name, count]) => ({ name, count }));
