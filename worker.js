@@ -64,7 +64,7 @@ function escapeTelegramHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace/>/g, "&gt;");
 }
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
@@ -82,7 +82,7 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   const cleanBody = escapeTelegramHtml(body);
   const formattedFetchTime = fetchedAt ? new Date(fetchedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) : "N/A";
 
-  const messageText = `  <b>${cleanTitle}</b>\n\n${cleanBody}\n\n  <b>Fetched:</b> ${formattedFetchTime}\n  <a href="${targetLink}">View Attachment / Details</a>`;
+  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n⚡ <b>Fetched:</b> ${formattedFetchTime}\n🔗 <a href="${targetLink}">View Attachment / Details</a>`;
 
   try {
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -470,14 +470,13 @@ function matchesWatchlist(item, watchlist) {
 
 async function monitorFeeds(env) {
   const fetchedAt = new Date().toISOString();
-  const [finRes, corpAnn] = await Promise.all([
+  const [finResRaw, corpAnnRaw] = await Promise.all([
     fetchXML(FINANCIAL_RESULTS_URL).then(xml => parseFinancialResults(xml, fetchedAt)).catch(() => []),
     fetchXML(CORPORATE_ANNOUNCEMENTS_URL).then(xml => parseCorporateAnnouncements(xml, fetchedAt)).catch(() => []),
   ]);
 
-  const rawItems = [...finRes, ...corpAnn];
+  const rawItems = [...finResRaw, ...corpAnnRaw];
   const items = await attachPersistentTimestamps(rawItems, env);
-
   const watchlist = await getWatchlist(env);
   const settings = await getNotificationSettings(env);
   const seen = await getSeen(env);
@@ -561,7 +560,8 @@ export default {
       if (url.pathname === "/categories") {
         const fetchedAt = new Date().toISOString();
         const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-        const items = parseCorporateAnnouncements(xml, fetchedAt);
+        const rawItems = parseCorporateAnnouncements(xml, fetchedAt);
+        const items = await attachPersistentTimestamps(rawItems, env);
         const map = new Map();
         items.forEach(i => i.categories.forEach(c => map.set(c, (map.get(c) || 0) + 1)));
         const categories = Array.from(map.entries()).map(([name, count]) => ({ name, count }));
