@@ -64,7 +64,7 @@ function escapeTelegramHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(//>/g, "&gt;");
 }
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
@@ -82,7 +82,7 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   const cleanBody = escapeTelegramHtml(body);
   const formattedFetchTime = fetchedAt ? new Date(fetchedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) : "N/A";
 
-  const messageText = ` <b>${cleanTitle}</b>\n\n${cleanBody}\n\n <b>Fetched:</b> ${formattedFetchTime}\n <a href="${targetLink}">View Attachment / Details</a>`;
+  const messageText = `  <b>${cleanTitle}</b>\n\n${cleanBody}\n\n  <b>Fetched:</b> ${formattedFetchTime}\n  <a href="${targetLink}">View Attachment / Details</a>`;
 
   try {
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -382,6 +382,48 @@ async function saveAlerts(env, alerts) {
   await env.BSE_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
+async function getTimestampMap(env) {
+  if (!env.BSE_DATA) return {};
+  const data = await env.BSE_DATA.get("announcementTimestamps", "json");
+  return data || {};
+}
+
+async function saveTimestampMap(env, map) {
+  if (!env.BSE_DATA) return;
+  const keys = Object.keys(map);
+  if (keys.length > 5000) {
+    const trimmedMap = {};
+    keys.slice(keys.length - 5000).forEach(k => {
+      trimmedMap[k] = map[k];
+    });
+    await env.BSE_DATA.put("announcementTimestamps", JSON.stringify(trimmedMap));
+  } else {
+    await env.BSE_DATA.put("announcementTimestamps", JSON.stringify(map));
+  }
+}
+
+async function attachPersistentTimestamps(items, env) {
+  const map = await getTimestampMap(env);
+  const now = new Date().toISOString();
+  let updated = false;
+
+  const results = items.map(item => {
+    if (map[item.id]) {
+      return { ...item, fetchedAt: map[item.id] };
+    } else {
+      map[item.id] = now;
+      updated = true;
+      return { ...item, fetchedAt: now };
+    }
+  });
+
+  if (updated) {
+    await saveTimestampMap(env, map);
+  }
+
+  return results;
+}
+
 /* ============================================================
    HYBRID MATCHING ENGINE
    ============================================================ */
@@ -433,7 +475,9 @@ async function monitorFeeds(env) {
     fetchXML(CORPORATE_ANNOUNCEMENTS_URL).then(xml => parseCorporateAnnouncements(xml, fetchedAt)).catch(() => []),
   ]);
 
-  const items = [...finRes, ...corpAnn];
+  const rawItems = [...finRes, ...corpAnn];
+  const items = await attachPersistentTimestamps(rawItems, env);
+
   const watchlist = await getWatchlist(env);
   const settings = await getNotificationSettings(env);
   const seen = await getSeen(env);
@@ -509,7 +553,8 @@ export default {
       if (url.pathname === "/bse-announcements") {
         const fetchedAt = new Date().toISOString();
         const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-        const items = parseCorporateAnnouncements(xml, fetchedAt);
+        const rawItems = parseCorporateAnnouncements(xml, fetchedAt);
+        const items = await attachPersistentTimestamps(rawItems, env);
         return json({ ok: true, count: items.length, items });
       }
 
