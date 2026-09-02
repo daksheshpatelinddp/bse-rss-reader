@@ -64,7 +64,7 @@ function escapeTelegramHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace/>/g, "&gt;");
+    .replace(/>/g, "&gt;");
 }
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
@@ -82,7 +82,7 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   const cleanBody = escapeTelegramHtml(body);
   const formattedFetchTime = fetchedAt ? new Date(fetchedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) : "N/A";
 
-  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n⚡ <b>Fetched:</b> ${formattedFetchTime}\n🔗 <a href="${targetLink}">View Attachment / Details</a>`;
+  const messageText = `  <b>${cleanTitle}</b>\n\n${cleanBody}\n\n  <b>Fetched:</b> ${formattedFetchTime}\n  <a href="${targetLink}">View Attachment / Details</a>`;
 
   try {
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
