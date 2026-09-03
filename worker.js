@@ -604,13 +604,6 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil((async () => {
-      for (let i = 0; i < 6; i++) {
-        await monitorFeeds(env);
-        if (i < 5) {
-          await new Promise(r => setTimeout(r, 10000));
-        }
-      }
-    })());
+    ctx.waitUntil(monitorFeeds(env));
   },
 };
