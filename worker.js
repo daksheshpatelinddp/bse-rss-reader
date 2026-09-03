@@ -1,8 +1,9 @@
 /*
  * BSE RSS READER
- * V5 - Faster detection using BSE JSON API (AnnSubCategoryGetData)
- *      + Watchlist Alerts + Telegram / ntfy
- *      + Designed for Cloudflare Cron (1 min) + GitHub Actions backup
+ * V5.1 - Faster detection using BSE JSON API (AnnSubCategoryGetData)
+ *       + Fixed Pub time (IST timezone)
+ *       + Watchlist Alerts + Telegram / ntfy
+ *       + Cloudflare Cron (1 min) + GitHub Actions backup
  *
  * KV binding: BSE_DATA
  * Secrets required in Cloudflare Worker:
@@ -14,7 +15,7 @@
 const FINANCIAL_RESULTS_URL =
   "https://beta.bseindia.com/Data/XML/FinancialResultsFeed.xml";
 
-// Primary (fresher) source – same data the BSE website uses
+// Primary (fresher) source � same data the BSE website uses
 const BSE_ANN_API =
   "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w";
 
@@ -90,7 +91,7 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
     ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
     : "N/A";
 
-  const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n⚡ <b>Fetched:</b> ${formattedFetchTime}\n🔗 <a href="${targetLink}">View Attachment / Details</a>`;
+  const messageText = ` <b>${cleanTitle}</b>\n\n${cleanBody}\n\n <b>Fetched:</b> ${formattedFetchTime}\n <a href="${targetLink}">View Attachment / Details</a>`;
 
   try {
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -169,7 +170,7 @@ async function fetchXML(url) {
   const response = await fetch(url, {
     method: "GET",
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.0)",
+      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.1)",
       Accept: "application/rss+xml, application/xml, text/xml, */*",
       "Cache-Control": "no-cache",
     },
@@ -352,7 +353,7 @@ function parseFinancialResults(xml, fetchedAt) {
   return items;
 }
 
-/** Parse the modern JSON API response (primary source) */
+/** Parse the modern JSON API response (primary source) - FIXED TIMEZONE */
 function parseBseJsonAnnouncements(table, fetchedAt) {
   const items = [];
 
@@ -364,10 +365,19 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
     const subCat = String(row.SUBCATNAME || "").trim();
     const description = [headline, subCat, categoryName].filter(Boolean).join(" | ");
 
+    // ===== FIXED PUB DATE (IST) =====
     let pubDate = row.DissemDT || row.News_submission_dt || row.NEWS_DT || row.DT_TM;
-    if (pubDate && !pubDate.includes("Z") && !pubDate.includes("+")) {
-      pubDate = new Date(pubDate).toUTCString();
+    if (pubDate) {
+      // BSE returns IST time without timezone info.
+      // We treat it as IST and convert properly.
+      if (!pubDate.includes("Z") && !pubDate.includes("+") && !pubDate.includes("-", 10)) {
+        pubDate = pubDate.replace(" ", "T") + "+05:30";
+      }
+      pubDate = new Date(pubDate).toISOString();
+    } else {
+      pubDate = new Date().toISOString();
     }
+    // ================================
 
     let link = "";
     if (row.ATTACHMENTNAME) {
@@ -397,7 +407,7 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
       title: headline || `${company} (${scrip})`,
       link,
       description,
-      pubDate: pubDate || new Date().toUTCString(),
+      pubDate: pubDate,
       fetchedAt,
       guid: stableId,
       id: stableId,
@@ -520,268 +530,4 @@ async function saveTimestampMap(env, map) {
   if (keys.length > 5000) {
     const trimmedMap = {};
     keys.slice(keys.length - 5000).forEach((k) => {
-      trimmedMap[k] = map[k];
-    });
-    await env.BSE_DATA.put("announcementTimestamps", JSON.stringify(trimmedMap));
-  } else {
-    await env.BSE_DATA.put("announcementTimestamps", JSON.stringify(map));
-  }
-}
-
-async function attachPersistentTimestamps(items, env) {
-  const map = await getTimestampMap(env);
-  const now = new Date().toISOString();
-  let updated = false;
-
-  const results = items.map((item) => {
-    if (map[item.id]) {
-      return { ...item, fetchedAt: map[item.id] };
-    } else {
-      map[item.id] = now;
-      updated = true;
-      return { ...item, fetchedAt: now };
-    }
-  });
-
-  if (updated) {
-    await saveTimestampMap(env, map);
-  }
-
-  return results;
-}
-
-/* ============================================================
-   HYBRID MATCHING ENGINE
-   ============================================================ */
-
-function matchesWatchlist(item, watchlist) {
-  if (!Array.isArray(watchlist) || watchlist.length === 0) return false;
-
-  const itemScripRaw = String(item.scrip || "");
-  const itemScripMatch = itemScripRaw.match(/\b(\d{6})\b/);
-  const itemScrip = itemScripMatch ? itemScripMatch[1] : itemScripRaw.trim();
-
-  const itemCompany = String(item.company || "").toLowerCase().trim();
-
-  return watchlist.some((watch) => {
-    const watchScripRaw = String(watch.scrip || "");
-    const watchScripMatch = watchScripRaw.match(/\b(\d{6})\b/);
-    const watchScrip = watchScripMatch ? watchScripMatch[1] : watchScripRaw.trim();
-
-    if (watchScrip && itemScrip && watchScrip === itemScrip) {
-      return true;
-    }
-
-    const watchNameRaw = String(watch.name || "");
-    const watchNameScripMatch = watchNameRaw.match(/\b(\d{6})\b/);
-    if (watchNameScripMatch && itemScrip && watchNameScripMatch[1] === itemScrip) {
-      return true;
-    }
-
-    const watchName = watchNameRaw.toLowerCase().trim();
-
-    if (watchName && watchName.length >= 3 && itemCompany) {
-      if (itemCompany.includes(watchName)) {
-        return true;
-      }
-    }
-
-    return false;
-  });
-}
-
-/* ============================================================
-   MONITOR CRON / GITHUB ACTION WORKER
-   ============================================================ */
-
-async function monitorFeeds(env) {
-  const fetchedAt = new Date().toISOString();
-
-  // 1. Primary: live JSON API (page 1 = newest 50)
-  let corpItems = [];
-  try {
-    const table = await fetchBseAnnouncementsJson(1);
-    corpItems = parseBseJsonAnnouncements(table, fetchedAt);
-  } catch (err) {
-    console.error("JSON API failed, falling back to RSS:", err.message);
-    try {
-      const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-      corpItems = parseCorporateAnnouncements(xml, fetchedAt);
-    } catch (e2) {
-      console.error("RSS fallback also failed:", e2.message);
-    }
-  }
-
-  // 2. Financial Results RSS
-  let finItems = [];
-  try {
-    const xml = await fetchXML(FINANCIAL_RESULTS_URL);
-    finItems = parseFinancialResults(xml, fetchedAt);
-  } catch (err) {
-    console.error("Financial Results feed failed:", err.message);
-  }
-
-  const rawItems = [...finItems, ...corpItems];
-  const items = await attachPersistentTimestamps(rawItems, env);
-  const watchlist = await getWatchlist(env);
-  const settings = await getNotificationSettings(env);
-  const seen = await getSeen(env);
-  const alerts = await getAlerts(env);
-
-  if (seen.length === 0) {
-    const ids = items.map((item) => item.id).filter(Boolean);
-    await saveSeen(env, ids);
-    return { status: "initialized baseline", count: items.length, source: "json+xml" };
-  }
-
-  const seenSet = new Set(seen);
-  const newItems = items.filter((item) => item.id && !seenSet.has(item.id));
-  let newAlertCount = 0;
-
-  for (const item of newItems) {
-    if (matchesWatchlist(item, watchlist)) {
-      if (!alerts.some((a) => a.id === item.id)) {
-        if (settings.telegram !== false) {
-          await sendTelegramAlert(
-            `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
-            item.title || "New Announcement",
-            item.scrip,
-            item.link,
-            item.fetchedAt,
-            env
-          );
-        }
-
-        if (settings.ntfy !== false) {
-          await sendNtfyAlert(
-            `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
-            item.title || "New Announcement",
-            item.scrip,
-            item.link,
-            item.fetchedAt,
-            env
-          );
-        }
-
-        alerts.unshift({
-          ...item,
-          alert: true,
-          alertCreatedAt: new Date().toISOString(),
-        });
-        newAlertCount++;
-      }
-    }
-  }
-
-  const updatedSeen = Array.from(
-    new Set([...newItems.map((i) => i.id), ...seen])
-  ).slice(0, MAX_SEEN);
-
-  await saveSeen(env, updatedSeen);
-  await saveAlerts(env, alerts);
-
-  return {
-    ok: true,
-    newAnnouncements: newItems.length,
-    newAlerts: newAlertCount,
-    source: corpItems.length ? "json-api" : "rss-fallback",
-    totalSeen: updatedSeen.length,
-  };
-}
-
-/* ============================================================
-   ROUTER & EXPORTS
-   ============================================================ */
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
-
-    try {
-      if (url.pathname === "/") {
-        return json({
-          status: "running",
-          app: "BSE RSS Reader",
-          version: "5",
-          sources: ["BSE JSON API (primary)", "Financial Results RSS", "Announcements RSS (fallback)"],
-        });
-      }
-
-      if (url.pathname === "/bse-announcements") {
-        const fetchedAt = new Date().toISOString();
-        let items = [];
-        try {
-          const table = await fetchBseAnnouncementsJson(1);
-          items = parseBseJsonAnnouncements(table, fetchedAt);
-        } catch (e) {
-          const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-          items = parseCorporateAnnouncements(xml, fetchedAt);
-        }
-        items = await attachPersistentTimestamps(items, env);
-        return json({ ok: true, count: items.length, items, source: "json-api" });
-      }
-
-      if (url.pathname === "/categories") {
-        const fetchedAt = new Date().toISOString();
-        let items = [];
-        try {
-          const table = await fetchBseAnnouncementsJson(1);
-          items = parseBseJsonAnnouncements(table, fetchedAt);
-        } catch (e) {
-          const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-          items = parseCorporateAnnouncements(xml, fetchedAt);
-        }
-        items = await attachPersistentTimestamps(items, env);
-        const map = new Map();
-        items.forEach((i) =>
-          i.categories.forEach((c) => map.set(c, (map.get(c) || 0) + 1))
-        );
-        const categories = Array.from(map.entries()).map(([name, count]) => ({
-          name,
-          count,
-        }));
-        return json({ ok: true, categories });
-      }
-
-      if (url.pathname === "/watchlist") {
-        if (request.method === "GET")
-          return json({ ok: true, watchlist: await getWatchlist(env) });
-        if (request.method === "POST") {
-          const body = await request.json();
-          await setWatchlist(env, body.watchlist || []);
-          return json({ ok: true, watchlist: body.watchlist });
-        }
-      }
-
-      if (url.pathname === "/notification-settings") {
-        if (request.method === "GET") {
-          return json({ ok: true, settings: await getNotificationSettings(env) });
-        }
-        if (request.method === "POST") {
-          const body = await request.json();
-          await setNotificationSettings(env, body);
-          return json({ ok: true, settings: body });
-        }
-      }
-
-      if (url.pathname === "/alerts") {
-        return json({ ok: true, items: await getAlerts(env) });
-      }
-
-      // Manual / GitHub Actions trigger
-      if (url.pathname === "/monitor") {
-        const res = await monitorFeeds(env);
-        return json(res);
-      }
-
-      return json({ error: "Not found" }, 404);
-    } catch (err) {
-      return json({ error: err.message }, 500);
-    }
-  },
-
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(monitorFeeds(env));
-  },
-};
+      trimmedMap[k] = 
