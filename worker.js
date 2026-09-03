@@ -1,15 +1,13 @@
 /*
  * BSE RSS READER
- * V5.2 - Hybrid
- *   • JSON API   fast new alerts / monitor
- *   • RSS feed   large list for frontend (old behaviour)
- *   • Fixed Pub time (IST)
+ * V5.3 - Hybrid + Dual Source Alerts
+ *   • Monitor checks BOTH JSON API and RSS
+ *   • Whichever finds new item first  sends Telegram/ntfy
+ *   • Frontend still uses large RSS list
+ *   • Fixed IST timezone
  *
  * KV binding: BSE_DATA
- * Secrets:
- *   - TELEGRAM_BOT_TOKEN
- *   - TELEGRAM_CHAT_ID
- *   - NTFY_TOPIC
+ * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
  */
 
 const FINANCIAL_RESULTS_URL =
@@ -168,7 +166,7 @@ async function fetchXML(url) {
   const response = await fetch(url, {
     method: "GET",
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.2)",
+      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.3)",
       Accept: "application/rss+xml, application/xml, text/xml, */*",
       "Cache-Control": "no-cache",
     },
@@ -322,7 +320,7 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
     const subCat = String(row.SUBCATNAME || "").trim();
     const description = [headline, subCat, categoryName].filter(Boolean).join(" | ");
 
-    // Fixed IST timezone
+    // Fixed IST
     let pubDate = row.DissemDT || row.News_submission_dt || row.NEWS_DT || row.DT_TM;
     if (pubDate) {
       if (!pubDate.includes("Z") && !pubDate.includes("+") && !pubDate.includes("-", 10)) {
@@ -539,38 +537,39 @@ function matchesWatchlist(item, watchlist) {
 }
 
 /* ============================================================
-   MONITOR (uses JSON API for speed)
+   MONITOR - NOW CHECKS BOTH SOURCES
    ============================================================ */
 
 async function monitorFeeds(env) {
   const fetchedAt = new Date().toISOString();
 
-  // Fast path: JSON API
-  let corpItems = [];
-  try {
-    const table = await fetchBseAnnouncementsJson(1);
-    corpItems = parseBseJsonAnnouncements(table, fetchedAt);
-  } catch (err) {
-    console.error("JSON API failed, falling back to RSS:", err.message);
-    try {
-      const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-      corpItems = parseCorporateAnnouncements(xml, fetchedAt);
-    } catch (e2) {
-      console.error("RSS fallback failed:", e2.message);
-    }
-  }
-
-  // Financial Results
+  // 1. Fetch from BOTH sources in parallel
+  let jsonItems = [];
+  let rssItems = [];
   let finItems = [];
-  try {
-    const xml = await fetchXML(FINANCIAL_RESULTS_URL);
-    finItems = parseFinancialResults(xml, fetchedAt);
-  } catch (err) {
-    console.error("Financial Results failed:", err.message);
-  }
 
-  const rawItems = [...finItems, ...corpItems];
+  const [jsonResult, rssResult, finResult] = await Promise.allSettled([
+    fetchBseAnnouncementsJson(1).then(table => parseBseJsonAnnouncements(table, fetchedAt)),
+    fetchXML(CORPORATE_ANNOUNCEMENTS_URL).then(xml => parseCorporateAnnouncements(xml, fetchedAt)),
+    fetchXML(FINANCIAL_RESULTS_URL).then(xml => parseFinancialResults(xml, fetchedAt)),
+  ]);
+
+  if (jsonResult.status === "fulfilled") jsonItems = jsonResult.value;
+  if (rssResult.status === "fulfilled") rssItems = rssResult.value;
+  if (finResult.status === "fulfilled") finItems = finResult.value;
+
+  // Combine all items (JSON + RSS + Financial)
+  // We use a Map so the same announcement from both sources appears only once
+  const allMap = new Map();
+  [...jsonItems, ...rssItems, ...finItems].forEach(item => {
+    if (item.id && !allMap.has(item.id)) {
+      allMap.set(item.id, item);
+    }
+  });
+
+  const rawItems = Array.from(allMap.values());
   const items = await attachPersistentTimestamps(rawItems, env);
+
   const watchlist = await getWatchlist(env);
   const settings = await getNotificationSettings(env);
   const seen = await getSeen(env);
@@ -579,7 +578,7 @@ async function monitorFeeds(env) {
   if (seen.length === 0) {
     const ids = items.map((item) => item.id).filter(Boolean);
     await saveSeen(env, ids);
-    return { status: "initialized baseline", count: items.length, source: "json+xml" };
+    return { status: "initialized baseline", count: items.length };
   }
 
   const seenSet = new Set(seen);
@@ -627,7 +626,11 @@ async function monitorFeeds(env) {
     ok: true,
     newAnnouncements: newItems.length,
     newAlerts: newAlertCount,
-    source: corpItems.length ? "json-api" : "rss-fallback",
+    sources: {
+      json: jsonItems.length,
+      rss: rssItems.length,
+      financial: finItems.length,
+    },
     totalSeen: updatedSeen.length,
   };
 }
@@ -646,12 +649,12 @@ export default {
         return json({
           status: "running",
           app: "BSE RSS Reader",
-          version: "5.2",
-          note: "JSON API for alerts + RSS for frontend list",
+          version: "5.3",
+          note: "Monitor checks both JSON + RSS. Frontend uses RSS list.",
         });
       }
 
-      // Frontend list  use large RSS feed
+      // Frontend still uses large RSS list
       if (url.pathname === "/bse-announcements") {
         const fetchedAt = new Date().toISOString();
         const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
