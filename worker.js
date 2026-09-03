@@ -1,7 +1,8 @@
 /*
  * BSE RSS READER
- * V4 - Improved BSE Corporate Announcement Categories
- *       + Watchlist Alerts / Special Bundle + Push Notifications via Telegram Bot & ntfy
+ * V5 - Faster detection using BSE JSON API (AnnSubCategoryGetData)
+ *      + Watchlist Alerts + Telegram / ntfy
+ *      + Designed for Cloudflare Cron (1 min) + GitHub Actions backup
  *
  * KV binding: BSE_DATA
  * Secrets required in Cloudflare Worker:
@@ -13,6 +14,11 @@
 const FINANCIAL_RESULTS_URL =
   "https://beta.bseindia.com/Data/XML/FinancialResultsFeed.xml";
 
+// Primary (fresher) source – same data the BSE website uses
+const BSE_ANN_API =
+  "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w";
+
+// Fallback RSS (kept for resilience)
 const CORPORATE_ANNOUNCEMENTS_URL =
   "https://beta.bseindia.com/data/xml/announcements.xml";
 
@@ -80,7 +86,9 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
 
   const cleanTitle = escapeTelegramHtml(title);
   const cleanBody = escapeTelegramHtml(body);
-  const formattedFetchTime = fetchedAt ? new Date(fetchedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) : "N/A";
+  const formattedFetchTime = fetchedAt
+    ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
+    : "N/A";
 
   const messageText = `🚨 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n⚡ <b>Fetched:</b> ${formattedFetchTime}\n🔗 <a href="${targetLink}">View Attachment / Details</a>`;
 
@@ -112,7 +120,9 @@ async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
     ? pdfLink
     : (scrip ? "https://www.bseindia.com/stock-share-price/" + scrip : "https://www.bseindia.com");
 
-  const formattedFetchTime = fetchedAt ? new Date(fetchedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) : "N/A";
+  const formattedFetchTime = fetchedAt
+    ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
+    : "N/A";
   const messageBody = `${body}\nFetched: ${formattedFetchTime}`;
 
   try {
@@ -120,11 +130,11 @@ async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
     await fetch(url, {
       method: "POST",
       headers: {
-        "Title": title,
-        "Click": targetLink,
-        "Tags": "chart_with_upwards_trend,warning"
+        Title: title,
+        Click: targetLink,
+        Tags: "chart_with_upwards_trend,warning",
       },
-      body: messageBody
+      body: messageBody,
     });
   } catch (err) {
     console.error("Failed to send ntfy alert:", err);
@@ -159,7 +169,7 @@ async function fetchXML(url) {
   const response = await fetch(url, {
     method: "GET",
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/4.0)",
+      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.0)",
       Accept: "application/rss+xml, application/xml, text/xml, */*",
       "Cache-Control": "no-cache",
     },
@@ -172,6 +182,47 @@ async function fetchXML(url) {
   return await response.text();
 }
 
+/** Fetch latest page of corporate announcements from the live JSON API */
+async function fetchBseAnnouncementsJson(pageNo = 1) {
+  const today = new Date();
+  // Use IST date (UTC+5:30)
+  const istOffset = 5.5 * 60 * 60 * 1000;
+  const ist = new Date(today.getTime() + istOffset);
+  const yyyy = ist.getUTCFullYear();
+  const mm = String(ist.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(ist.getUTCDate()).padStart(2, "0");
+  const dateStr = `${yyyy}${mm}${dd}`;
+
+  const url =
+    `${BSE_ANN_API}?pageno=${pageNo}` +
+    `&strCat=-1&subcategory=-1` +
+    `&strPrevDate=${dateStr}&strToDate=${dateStr}` +
+    `&strSearch=P&strscrip=&strType=C`;
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "application/json, text/plain, */*",
+      Referer: "https://www.bseindia.com/",
+      Origin: "https://www.bseindia.com",
+      "Cache-Control": "no-cache",
+    },
+    cf: { cacheTtl: 0, cacheEverything: false },
+  });
+
+  if (!response.ok) {
+    throw new Error(`BSE JSON API HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (!data || !Array.isArray(data.Table)) {
+    return [];
+  }
+  return data.Table;
+}
+
 /* ============================================================
    CLASSIFICATION RULES
    ============================================================ */
@@ -180,9 +231,15 @@ const CATEGORY_RULES = [
   {
     name: "Financial Results",
     words: [
-      "financial results", "financial result", "unaudited financial results",
-      "audited financial results", "quarterly results", "quarterly result",
-      "results for the quarter", "standalone financial results", "consolidated financial results"
+      "financial results",
+      "financial result",
+      "unaudited financial results",
+      "audited financial results",
+      "quarterly results",
+      "quarterly result",
+      "results for the quarter",
+      "standalone financial results",
+      "consolidated financial results",
     ],
   },
   {
@@ -207,7 +264,7 @@ const CATEGORY_RULES = [
   },
   {
     name: "Order / Contract",
-    words: ["order received", "order win", "work order", "contract awarded"],
+    words: ["order received", "order win", "work order", "contract awarded", "award of order", "receipt of order"],
   },
   {
     name: "Credit Rating",
@@ -216,16 +273,28 @@ const CATEGORY_RULES = [
   {
     name: "Appointment / Resignation",
     words: ["appointment", "resignation", "cessation", "change in management"],
-  }
+  },
 ];
 
-function classifyAnnouncement(title, description) {
-  const text = `${title || ""} ${description || ""}`.toLowerCase().replace(/\s+/g, " ").trim();
+function classifyAnnouncement(title, description, categoryName) {
+  const text = `${title || ""} ${description || ""} ${categoryName || ""}`
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
   const categories = [];
 
   for (const rule of CATEGORY_RULES) {
-    if (rule.words.some(word => text.includes(word))) {
+    if (rule.words.some((word) => text.includes(word))) {
       categories.push(rule.name);
+    }
+  }
+
+  if (categoryName) {
+    const cn = categoryName.toLowerCase();
+    if (cn.includes("result") && !categories.includes("Financial Results")) {
+      categories.unshift("Financial Results");
+    } else if (cn.includes("dividend") && !categories.includes("Dividend")) {
+      categories.unshift("Dividend");
     }
   }
 
@@ -283,6 +352,63 @@ function parseFinancialResults(xml, fetchedAt) {
   return items;
 }
 
+/** Parse the modern JSON API response (primary source) */
+function parseBseJsonAnnouncements(table, fetchedAt) {
+  const items = [];
+
+  for (const row of table) {
+    const scrip = String(row.SCRIP_CD || "").trim();
+    const company = String(row.SLONGNAME || "").trim() || "Unknown Company";
+    const headline = String(row.HEADLINE || row.NEWSSUB || "").trim();
+    const categoryName = String(row.CATEGORYNAME || "").trim();
+    const subCat = String(row.SUBCATNAME || "").trim();
+    const description = [headline, subCat, categoryName].filter(Boolean).join(" | ");
+
+    let pubDate = row.DissemDT || row.News_submission_dt || row.NEWS_DT || row.DT_TM;
+    if (pubDate && !pubDate.includes("Z") && !pubDate.includes("+")) {
+      pubDate = new Date(pubDate).toUTCString();
+    }
+
+    let link = "";
+    if (row.ATTACHMENTNAME) {
+      link = `https://www.bseindia.com/xml-data/corpfiling/AttachLive/${row.ATTACHMENTNAME}`;
+    } else if (row.NSURL) {
+      link = row.NSURL;
+    }
+
+    const classification = classifyAnnouncement(headline, description, categoryName);
+
+    const stableId =
+      row.NEWSID ||
+      row.BSENEWSID ||
+      (scrip && row.ATTACHMENTNAME
+        ? `${scrip}|${row.ATTACHMENTNAME}`
+        : `${scrip}|${headline}|${pubDate}`);
+
+    if (!headline && !description) continue;
+
+    items.push({
+      feed: "Corporate Announcements",
+      company,
+      scrip,
+      category: classification.category,
+      categories: classification.categories,
+      isFinancialResult: classification.isFinancialResult,
+      title: headline || `${company} (${scrip})`,
+      link,
+      description,
+      pubDate: pubDate || new Date().toUTCString(),
+      fetchedAt,
+      guid: stableId,
+      id: stableId,
+      bseCategory: categoryName,
+      attachment: row.ATTACHMENTNAME || null,
+    });
+  }
+
+  return items;
+}
+
 function parseCorporateAnnouncements(xml, fetchedAt) {
   const items = [];
   const matches = xml.match(/<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi) || [];
@@ -311,7 +437,7 @@ function parseCorporateAnnouncements(xml, fetchedAt) {
       if (scripMatch) scrip = scripMatch[1];
     }
 
-    const classification = classifyAnnouncement(title, description);
+    const classification = classifyAnnouncement(title, description, "");
     const stableId = guid || link || `${title}|${description}|${pubDate}`;
 
     items.push({
@@ -393,7 +519,7 @@ async function saveTimestampMap(env, map) {
   const keys = Object.keys(map);
   if (keys.length > 5000) {
     const trimmedMap = {};
-    keys.slice(keys.length - 5000).forEach(k => {
+    keys.slice(keys.length - 5000).forEach((k) => {
       trimmedMap[k] = map[k];
     });
     await env.BSE_DATA.put("announcementTimestamps", JSON.stringify(trimmedMap));
@@ -407,7 +533,7 @@ async function attachPersistentTimestamps(items, env) {
   const now = new Date().toISOString();
   let updated = false;
 
-  const results = items.map(item => {
+  const results = items.map((item) => {
     if (map[item.id]) {
       return { ...item, fetchedAt: map[item.id] };
     } else {
@@ -437,7 +563,7 @@ function matchesWatchlist(item, watchlist) {
 
   const itemCompany = String(item.company || "").toLowerCase().trim();
 
-  return watchlist.some(watch => {
+  return watchlist.some((watch) => {
     const watchScripRaw = String(watch.scrip || "");
     const watchScripMatch = watchScripRaw.match(/\b(\d{6})\b/);
     const watchScrip = watchScripMatch ? watchScripMatch[1] : watchScripRaw.trim();
@@ -465,17 +591,37 @@ function matchesWatchlist(item, watchlist) {
 }
 
 /* ============================================================
-   MONITOR CRON WORKER
+   MONITOR CRON / GITHUB ACTION WORKER
    ============================================================ */
 
 async function monitorFeeds(env) {
   const fetchedAt = new Date().toISOString();
-  const [finResRaw, corpAnnRaw] = await Promise.all([
-    fetchXML(FINANCIAL_RESULTS_URL).then(xml => parseFinancialResults(xml, fetchedAt)).catch(() => []),
-    fetchXML(CORPORATE_ANNOUNCEMENTS_URL).then(xml => parseCorporateAnnouncements(xml, fetchedAt)).catch(() => []),
-  ]);
 
-  const rawItems = [...finResRaw, ...corpAnnRaw];
+  // 1. Primary: live JSON API (page 1 = newest 50)
+  let corpItems = [];
+  try {
+    const table = await fetchBseAnnouncementsJson(1);
+    corpItems = parseBseJsonAnnouncements(table, fetchedAt);
+  } catch (err) {
+    console.error("JSON API failed, falling back to RSS:", err.message);
+    try {
+      const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
+      corpItems = parseCorporateAnnouncements(xml, fetchedAt);
+    } catch (e2) {
+      console.error("RSS fallback also failed:", e2.message);
+    }
+  }
+
+  // 2. Financial Results RSS
+  let finItems = [];
+  try {
+    const xml = await fetchXML(FINANCIAL_RESULTS_URL);
+    finItems = parseFinancialResults(xml, fetchedAt);
+  } catch (err) {
+    console.error("Financial Results feed failed:", err.message);
+  }
+
+  const rawItems = [...finItems, ...corpItems];
   const items = await attachPersistentTimestamps(rawItems, env);
   const watchlist = await getWatchlist(env);
   const settings = await getNotificationSettings(env);
@@ -483,20 +629,18 @@ async function monitorFeeds(env) {
   const alerts = await getAlerts(env);
 
   if (seen.length === 0) {
-    const ids = items.map(item => item.id).filter(Boolean);
+    const ids = items.map((item) => item.id).filter(Boolean);
     await saveSeen(env, ids);
-    return { status: "initialized baseline", count: items.length };
+    return { status: "initialized baseline", count: items.length, source: "json+xml" };
   }
 
   const seenSet = new Set(seen);
-  const newItems = items.filter(item => item.id && !seenSet.has(item.id));
+  const newItems = items.filter((item) => item.id && !seenSet.has(item.id));
   let newAlertCount = 0;
 
   for (const item of newItems) {
     if (matchesWatchlist(item, watchlist)) {
-      if (!alerts.some(a => a.id === item.id)) {
-
-        // Send Telegram notification if enabled
+      if (!alerts.some((a) => a.id === item.id)) {
         if (settings.telegram !== false) {
           await sendTelegramAlert(
             `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
@@ -508,7 +652,6 @@ async function monitorFeeds(env) {
           );
         }
 
-        // Send ntfy notification if enabled
         if (settings.ntfy !== false) {
           await sendNtfyAlert(
             `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
@@ -530,11 +673,20 @@ async function monitorFeeds(env) {
     }
   }
 
-  const updatedSeen = Array.from(new Set([...newItems.map(i => i.id), ...seen])).slice(0, MAX_SEEN);
+  const updatedSeen = Array.from(
+    new Set([...newItems.map((i) => i.id), ...seen])
+  ).slice(0, MAX_SEEN);
+
   await saveSeen(env, updatedSeen);
   await saveAlerts(env, alerts);
 
-  return { ok: true, newAnnouncements: newItems.length, newAlerts: newAlertCount };
+  return {
+    ok: true,
+    newAnnouncements: newItems.length,
+    newAlerts: newAlertCount,
+    source: corpItems.length ? "json-api" : "rss-fallback",
+    totalSeen: updatedSeen.length,
+  };
 }
 
 /* ============================================================
@@ -547,29 +699,54 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
 
     try {
-      if (url.pathname === "/") return json({ status: "running", app: "BSE RSS Reader" });
+      if (url.pathname === "/") {
+        return json({
+          status: "running",
+          app: "BSE RSS Reader",
+          version: "5",
+          sources: ["BSE JSON API (primary)", "Financial Results RSS", "Announcements RSS (fallback)"],
+        });
+      }
 
       if (url.pathname === "/bse-announcements") {
         const fetchedAt = new Date().toISOString();
-        const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-        const rawItems = parseCorporateAnnouncements(xml, fetchedAt);
-        const items = await attachPersistentTimestamps(rawItems, env);
-        return json({ ok: true, count: items.length, items });
+        let items = [];
+        try {
+          const table = await fetchBseAnnouncementsJson(1);
+          items = parseBseJsonAnnouncements(table, fetchedAt);
+        } catch (e) {
+          const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
+          items = parseCorporateAnnouncements(xml, fetchedAt);
+        }
+        items = await attachPersistentTimestamps(items, env);
+        return json({ ok: true, count: items.length, items, source: "json-api" });
       }
 
       if (url.pathname === "/categories") {
         const fetchedAt = new Date().toISOString();
-        const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-        const rawItems = parseCorporateAnnouncements(xml, fetchedAt);
-        const items = await attachPersistentTimestamps(rawItems, env);
+        let items = [];
+        try {
+          const table = await fetchBseAnnouncementsJson(1);
+          items = parseBseJsonAnnouncements(table, fetchedAt);
+        } catch (e) {
+          const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
+          items = parseCorporateAnnouncements(xml, fetchedAt);
+        }
+        items = await attachPersistentTimestamps(items, env);
         const map = new Map();
-        items.forEach(i => i.categories.forEach(c => map.set(c, (map.get(c) || 0) + 1)));
-        const categories = Array.from(map.entries()).map(([name, count]) => ({ name, count }));
+        items.forEach((i) =>
+          i.categories.forEach((c) => map.set(c, (map.get(c) || 0) + 1))
+        );
+        const categories = Array.from(map.entries()).map(([name, count]) => ({
+          name,
+          count,
+        }));
         return json({ ok: true, categories });
       }
 
       if (url.pathname === "/watchlist") {
-        if (request.method === "GET") return json({ ok: true, watchlist: await getWatchlist(env) });
+        if (request.method === "GET")
+          return json({ ok: true, watchlist: await getWatchlist(env) });
         if (request.method === "POST") {
           const body = await request.json();
           await setWatchlist(env, body.watchlist || []);
@@ -592,6 +769,7 @@ export default {
         return json({ ok: true, items: await getAlerts(env) });
       }
 
+      // Manual / GitHub Actions trigger
       if (url.pathname === "/monitor") {
         const res = await monitorFeeds(env);
         return json(res);
