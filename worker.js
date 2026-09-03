@@ -1,9 +1,9 @@
 /*
  * BSE RSS READER
- * V5.3 - Hybrid + Dual Source Alerts
- *   • Monitor checks BOTH JSON API and RSS
- *   • Whichever finds new item first  sends Telegram/ntfy
- *   • Frontend still uses large RSS list
+ * V5.4 - Dual Source Alerts (Safe)
+ *   • Monitor checks both JSON API + RSS (newest items only)
+ *   • No new watchlist announcement left unattended
+ *   • Frontend still uses full RSS list
  *   • Fixed IST timezone
  *
  * KV binding: BSE_DATA
@@ -21,6 +21,11 @@ const CORPORATE_ANNOUNCEMENTS_URL =
 
 const MAX_SEEN = 10000;
 const MAX_ALERTS = 1000;
+
+// How many newest items to check from each source for alerts
+const MAX_JSON_FOR_ALERTS = 50;
+const MAX_RSS_FOR_ALERTS = 300;   // enough to catch everything recent
+const MAX_FIN_FOR_ALERTS = 50;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -166,7 +171,7 @@ async function fetchXML(url) {
   const response = await fetch(url, {
     method: "GET",
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.3)",
+      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.4)",
       Accept: "application/rss+xml, application/xml, text/xml, */*",
       "Cache-Control": "no-cache",
     },
@@ -320,7 +325,6 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
     const subCat = String(row.SUBCATNAME || "").trim();
     const description = [headline, subCat, categoryName].filter(Boolean).join(" | ");
 
-    // Fixed IST
     let pubDate = row.DissemDT || row.News_submission_dt || row.NEWS_DT || row.DT_TM;
     if (pubDate) {
       if (!pubDate.includes("Z") && !pubDate.includes("+") && !pubDate.includes("-", 10)) {
@@ -537,13 +541,12 @@ function matchesWatchlist(item, watchlist) {
 }
 
 /* ============================================================
-   MONITOR - NOW CHECKS BOTH SOURCES
+   MONITOR - SAFE DUAL SOURCE (newest items only)
    ============================================================ */
 
 async function monitorFeeds(env) {
   const fetchedAt = new Date().toISOString();
 
-  // 1. Fetch from BOTH sources in parallel
   let jsonItems = [];
   let rssItems = [];
   let finItems = [];
@@ -554,12 +557,18 @@ async function monitorFeeds(env) {
     fetchXML(FINANCIAL_RESULTS_URL).then(xml => parseFinancialResults(xml, fetchedAt)),
   ]);
 
-  if (jsonResult.status === "fulfilled") jsonItems = jsonResult.value;
-  if (rssResult.status === "fulfilled") rssItems = rssResult.value;
-  if (finResult.status === "fulfilled") finItems = finResult.value;
+  if (jsonResult.status === "fulfilled") {
+    jsonItems = jsonResult.value.slice(0, MAX_JSON_FOR_ALERTS);
+  }
+  if (rssResult.status === "fulfilled") {
+    // Take only the newest items from RSS for alerts
+    rssItems = rssResult.value.slice(0, MAX_RSS_FOR_ALERTS);
+  }
+  if (finResult.status === "fulfilled") {
+    finItems = finResult.value.slice(0, MAX_FIN_FOR_ALERTS);
+  }
 
-  // Combine all items (JSON + RSS + Financial)
-  // We use a Map so the same announcement from both sources appears only once
+  // Combine and remove duplicates by id
   const allMap = new Map();
   [...jsonItems, ...rssItems, ...finItems].forEach(item => {
     if (item.id && !allMap.has(item.id)) {
@@ -618,6 +627,7 @@ async function monitorFeeds(env) {
     }
   }
 
+  // Only add the new items we just processed to the seen list
   const updatedSeen = Array.from(new Set([...newItems.map((i) => i.id), ...seen])).slice(0, MAX_SEEN);
   await saveSeen(env, updatedSeen);
   await saveAlerts(env, alerts);
@@ -649,12 +659,12 @@ export default {
         return json({
           status: "running",
           app: "BSE RSS Reader",
-          version: "5.3",
-          note: "Monitor checks both JSON + RSS. Frontend uses RSS list.",
+          version: "5.4",
+          note: "Safe dual-source alerts (newest items only)",
         });
       }
 
-      // Frontend still uses large RSS list
+      // Frontend uses full RSS list
       if (url.pathname === "/bse-announcements") {
         const fetchedAt = new Date().toISOString();
         const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
