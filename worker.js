@@ -1,12 +1,12 @@
 /*
  * BSE RSS READER
- * V5.1 - Faster detection using BSE JSON API (AnnSubCategoryGetData)
- *       + Fixed Pub time (IST timezone)
- *       + Watchlist Alerts + Telegram / ntfy
- *       + Cloudflare Cron (1 min) + GitHub Actions backup
+ * V5.2 - Hybrid
+ *   • JSON API   fast new alerts / monitor
+ *   • RSS feed   large list for frontend (old behaviour)
+ *   • Fixed Pub time (IST)
  *
  * KV binding: BSE_DATA
- * Secrets required in Cloudflare Worker:
+ * Secrets:
  *   - TELEGRAM_BOT_TOKEN
  *   - TELEGRAM_CHAT_ID
  *   - NTFY_TOPIC
@@ -15,11 +15,9 @@
 const FINANCIAL_RESULTS_URL =
   "https://beta.bseindia.com/Data/XML/FinancialResultsFeed.xml";
 
-// Primary (fresher) source – same data the BSE website uses
 const BSE_ANN_API =
   "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w";
 
-// Fallback RSS (kept for resilience)
 const CORPORATE_ANNOUNCEMENTS_URL =
   "https://beta.bseindia.com/data/xml/announcements.xml";
 
@@ -33,7 +31,7 @@ const CORS_HEADERS = {
 };
 
 /* ============================================================
-   HELPERS & UTILS
+   HELPERS
    ============================================================ */
 
 function json(data, status = 200) {
@@ -76,7 +74,7 @@ function escapeTelegramHtml(text) {
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
-    console.error("Telegram credentials missing in Worker environment variables.");
+    console.error("Telegram credentials missing.");
     return;
   }
 
@@ -106,13 +104,13 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
       }),
     });
   } catch (err) {
-    console.error("Failed to send Telegram alert:", err);
+    console.error("Telegram error:", err);
   }
 }
 
 async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
   if (!env.NTFY_TOPIC) {
-    console.error("NTFY_TOPIC missing in Worker environment variables.");
+    console.error("NTFY_TOPIC missing.");
     return;
   }
 
@@ -138,7 +136,7 @@ async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
       body: messageBody,
     });
   } catch (err) {
-    console.error("Failed to send ntfy alert:", err);
+    console.error("ntfy error:", err);
   }
 }
 
@@ -170,23 +168,19 @@ async function fetchXML(url) {
   const response = await fetch(url, {
     method: "GET",
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.1)",
+      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.2)",
       Accept: "application/rss+xml, application/xml, text/xml, */*",
       "Cache-Control": "no-cache",
     },
     cf: { cacheTtl: 0, cacheEverything: false },
   });
 
-  if (!response.ok) {
-    throw new Error(`BSE feed HTTP ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`BSE feed HTTP ${response.status}`);
   return await response.text();
 }
 
-/** Fetch latest page of corporate announcements from the live JSON API */
 async function fetchBseAnnouncementsJson(pageNo = 1) {
   const today = new Date();
-  // Use IST date (UTC+5:30)
   const istOffset = 5.5 * 60 * 60 * 1000;
   const ist = new Date(today.getTime() + istOffset);
   const yyyy = ist.getUTCFullYear();
@@ -213,75 +207,38 @@ async function fetchBseAnnouncementsJson(pageNo = 1) {
     cf: { cacheTtl: 0, cacheEverything: false },
   });
 
-  if (!response.ok) {
-    throw new Error(`BSE JSON API HTTP ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`BSE JSON API HTTP ${response.status}`);
 
   const data = await response.json();
-  if (!data || !Array.isArray(data.Table)) {
-    return [];
-  }
+  if (!data || !Array.isArray(data.Table)) return [];
   return data.Table;
 }
 
 /* ============================================================
-   CLASSIFICATION RULES
+   CLASSIFICATION
    ============================================================ */
 
 const CATEGORY_RULES = [
   {
     name: "Financial Results",
     words: [
-      "financial results",
-      "financial result",
-      "unaudited financial results",
-      "audited financial results",
-      "quarterly results",
-      "quarterly result",
-      "results for the quarter",
-      "standalone financial results",
-      "consolidated financial results",
+      "financial results", "financial result", "unaudited financial results",
+      "audited financial results", "quarterly results", "quarterly result",
+      "results for the quarter", "standalone financial results", "consolidated financial results",
     ],
   },
-  {
-    name: "Board Meeting",
-    words: ["board meeting", "meeting of the board", "outcome of board meeting"],
-  },
-  {
-    name: "Dividend",
-    words: ["dividend", "interim dividend", "final dividend", "special dividend"],
-  },
-  {
-    name: "Bonus",
-    words: ["bonus issue", "bonus shares", "issue of bonus shares"],
-  },
-  {
-    name: "Fund Raising",
-    words: ["fund raising", "fundraising", "qip", "private placement", "preferential issue"],
-  },
-  {
-    name: "Acquisition",
-    words: ["acquisition", "acquire", "acquired", "takeover"],
-  },
-  {
-    name: "Order / Contract",
-    words: ["order received", "order win", "work order", "contract awarded", "award of order", "receipt of order"],
-  },
-  {
-    name: "Credit Rating",
-    words: ["credit rating", "rating reaffirmed", "rating upgrade", "rating downgrade"],
-  },
-  {
-    name: "Appointment / Resignation",
-    words: ["appointment", "resignation", "cessation", "change in management"],
-  },
+  { name: "Board Meeting", words: ["board meeting", "meeting of the board", "outcome of board meeting"] },
+  { name: "Dividend", words: ["dividend", "interim dividend", "final dividend", "special dividend"] },
+  { name: "Bonus", words: ["bonus issue", "bonus shares", "issue of bonus shares"] },
+  { name: "Fund Raising", words: ["fund raising", "fundraising", "qip", "private placement", "preferential issue"] },
+  { name: "Acquisition", words: ["acquisition", "acquire", "acquired", "takeover"] },
+  { name: "Order / Contract", words: ["order received", "order win", "work order", "contract awarded", "award of order", "receipt of order"] },
+  { name: "Credit Rating", words: ["credit rating", "rating reaffirmed", "rating upgrade", "rating downgrade"] },
+  { name: "Appointment / Resignation", words: ["appointment", "resignation", "cessation", "change in management"] },
 ];
 
 function classifyAnnouncement(title, description, categoryName) {
-  const text = `${title || ""} ${description || ""} ${categoryName || ""}`
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
+  const text = `${title || ""} ${description || ""} ${categoryName || ""}`.toLowerCase().replace(/\s+/g, " ").trim();
   const categories = [];
 
   for (const rule of CATEGORY_RULES) {
@@ -300,9 +257,11 @@ function classifyAnnouncement(title, description, categoryName) {
   }
 
   if (categories.length === 0) categories.push("Other");
-  const isFinancialResult = categories.includes("Financial Results");
-
-  return { category: categories[0], categories, isFinancialResult };
+  return {
+    category: categories[0],
+    categories,
+    isFinancialResult: categories.includes("Financial Results"),
+  };
 }
 
 /* ============================================================
@@ -349,11 +308,9 @@ function parseFinancialResults(xml, fetchedAt) {
       id: stableId,
     });
   }
-
   return items;
 }
 
-/** Parse the modern JSON API response (primary source) - FIXED TIMEZONE */
 function parseBseJsonAnnouncements(table, fetchedAt) {
   const items = [];
 
@@ -365,11 +322,9 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
     const subCat = String(row.SUBCATNAME || "").trim();
     const description = [headline, subCat, categoryName].filter(Boolean).join(" | ");
 
-    // ===== FIXED PUB DATE (IST) =====
+    // Fixed IST timezone
     let pubDate = row.DissemDT || row.News_submission_dt || row.NEWS_DT || row.DT_TM;
     if (pubDate) {
-      // BSE returns IST time without timezone info.
-      // We treat it as IST and convert properly.
       if (!pubDate.includes("Z") && !pubDate.includes("+") && !pubDate.includes("-", 10)) {
         pubDate = pubDate.replace(" ", "T") + "+05:30";
       }
@@ -377,7 +332,6 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
     } else {
       pubDate = new Date().toISOString();
     }
-    // ================================
 
     let link = "";
     if (row.ATTACHMENTNAME) {
@@ -391,9 +345,7 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
     const stableId =
       row.NEWSID ||
       row.BSENEWSID ||
-      (scrip && row.ATTACHMENTNAME
-        ? `${scrip}|${row.ATTACHMENTNAME}`
-        : `${scrip}|${headline}|${pubDate}`);
+      (scrip && row.ATTACHMENTNAME ? `${scrip}|${row.ATTACHMENTNAME}` : `${scrip}|${headline}|${pubDate}`);
 
     if (!headline && !description) continue;
 
@@ -407,7 +359,7 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
       title: headline || `${company} (${scrip})`,
       link,
       description,
-      pubDate: pubDate,
+      pubDate,
       fetchedAt,
       guid: stableId,
       id: stableId,
@@ -415,7 +367,6 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
       attachment: row.ATTACHMENTNAME || null,
     });
   }
-
   return items;
 }
 
@@ -466,12 +417,11 @@ function parseCorporateAnnouncements(xml, fetchedAt) {
       id: stableId,
     });
   }
-
   return items;
 }
 
 /* ============================================================
-   KV STORAGE OPERATIONS
+   KV
    ============================================================ */
 
 async function getWatchlist(env) {
@@ -553,15 +503,12 @@ async function attachPersistentTimestamps(items, env) {
     }
   });
 
-  if (updated) {
-    await saveTimestampMap(env, map);
-  }
-
+  if (updated) await saveTimestampMap(env, map);
   return results;
 }
 
 /* ============================================================
-   HYBRID MATCHING ENGINE
+   MATCHING
    ============================================================ */
 
 function matchesWatchlist(item, watchlist) {
@@ -570,7 +517,6 @@ function matchesWatchlist(item, watchlist) {
   const itemScripRaw = String(item.scrip || "");
   const itemScripMatch = itemScripRaw.match(/\b(\d{6})\b/);
   const itemScrip = itemScripMatch ? itemScripMatch[1] : itemScripRaw.trim();
-
   const itemCompany = String(item.company || "").toLowerCase().trim();
 
   return watchlist.some((watch) => {
@@ -578,36 +524,28 @@ function matchesWatchlist(item, watchlist) {
     const watchScripMatch = watchScripRaw.match(/\b(\d{6})\b/);
     const watchScrip = watchScripMatch ? watchScripMatch[1] : watchScripRaw.trim();
 
-    if (watchScrip && itemScrip && watchScrip === itemScrip) {
-      return true;
-    }
+    if (watchScrip && itemScrip && watchScrip === itemScrip) return true;
 
     const watchNameRaw = String(watch.name || "");
     const watchNameScripMatch = watchNameRaw.match(/\b(\d{6})\b/);
-    if (watchNameScripMatch && itemScrip && watchNameScripMatch[1] === itemScrip) {
-      return true;
-    }
+    if (watchNameScripMatch && itemScrip && watchNameScripMatch[1] === itemScrip) return true;
 
     const watchName = watchNameRaw.toLowerCase().trim();
-
-    if (watchName && watchName.length >= 3 && itemCompany) {
-      if (itemCompany.includes(watchName)) {
-        return true;
-      }
+    if (watchName && watchName.length >= 3 && itemCompany && itemCompany.includes(watchName)) {
+      return true;
     }
-
     return false;
   });
 }
 
 /* ============================================================
-   MONITOR CRON / GITHUB ACTION WORKER
+   MONITOR (uses JSON API for speed)
    ============================================================ */
 
 async function monitorFeeds(env) {
   const fetchedAt = new Date().toISOString();
 
-  // 1. Primary: live JSON API (page 1 = newest 50)
+  // Fast path: JSON API
   let corpItems = [];
   try {
     const table = await fetchBseAnnouncementsJson(1);
@@ -618,17 +556,17 @@ async function monitorFeeds(env) {
       const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
       corpItems = parseCorporateAnnouncements(xml, fetchedAt);
     } catch (e2) {
-      console.error("RSS fallback also failed:", e2.message);
+      console.error("RSS fallback failed:", e2.message);
     }
   }
 
-  // 2. Financial Results RSS
+  // Financial Results
   let finItems = [];
   try {
     const xml = await fetchXML(FINANCIAL_RESULTS_URL);
     finItems = parseFinancialResults(xml, fetchedAt);
   } catch (err) {
-    console.error("Financial Results feed failed:", err.message);
+    console.error("Financial Results failed:", err.message);
   }
 
   const rawItems = [...finItems, ...corpItems];
@@ -661,7 +599,6 @@ async function monitorFeeds(env) {
             env
           );
         }
-
         if (settings.ntfy !== false) {
           await sendNtfyAlert(
             `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
@@ -672,7 +609,6 @@ async function monitorFeeds(env) {
             env
           );
         }
-
         alerts.unshift({
           ...item,
           alert: true,
@@ -683,10 +619,7 @@ async function monitorFeeds(env) {
     }
   }
 
-  const updatedSeen = Array.from(
-    new Set([...newItems.map((i) => i.id), ...seen])
-  ).slice(0, MAX_SEEN);
-
+  const updatedSeen = Array.from(new Set([...newItems.map((i) => i.id), ...seen])).slice(0, MAX_SEEN);
   await saveSeen(env, updatedSeen);
   await saveAlerts(env, alerts);
 
@@ -700,7 +633,7 @@ async function monitorFeeds(env) {
 }
 
 /* ============================================================
-   ROUTER & EXPORTS
+   ROUTER
    ============================================================ */
 
 export default {
@@ -713,50 +646,33 @@ export default {
         return json({
           status: "running",
           app: "BSE RSS Reader",
-          version: "5.1",
-          sources: ["BSE JSON API (primary)", "Financial Results RSS", "Announcements RSS (fallback)"],
+          version: "5.2",
+          note: "JSON API for alerts + RSS for frontend list",
         });
       }
 
+      // Frontend list  use large RSS feed
       if (url.pathname === "/bse-announcements") {
         const fetchedAt = new Date().toISOString();
-        let items = [];
-        try {
-          const table = await fetchBseAnnouncementsJson(1);
-          items = parseBseJsonAnnouncements(table, fetchedAt);
-        } catch (e) {
-          const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-          items = parseCorporateAnnouncements(xml, fetchedAt);
-        }
+        const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
+        let items = parseCorporateAnnouncements(xml, fetchedAt);
         items = await attachPersistentTimestamps(items, env);
-        return json({ ok: true, count: items.length, items, source: "json-api" });
+        return json({ ok: true, count: items.length, items, source: "rss" });
       }
 
       if (url.pathname === "/categories") {
         const fetchedAt = new Date().toISOString();
-        let items = [];
-        try {
-          const table = await fetchBseAnnouncementsJson(1);
-          items = parseBseJsonAnnouncements(table, fetchedAt);
-        } catch (e) {
-          const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-          items = parseCorporateAnnouncements(xml, fetchedAt);
-        }
+        const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
+        let items = parseCorporateAnnouncements(xml, fetchedAt);
         items = await attachPersistentTimestamps(items, env);
         const map = new Map();
-        items.forEach((i) =>
-          i.categories.forEach((c) => map.set(c, (map.get(c) || 0) + 1))
-        );
-        const categories = Array.from(map.entries()).map(([name, count]) => ({
-          name,
-          count,
-        }));
+        items.forEach((i) => i.categories.forEach((c) => map.set(c, (map.get(c) || 0) + 1)));
+        const categories = Array.from(map.entries()).map(([name, count]) => ({ name, count }));
         return json({ ok: true, categories });
       }
 
       if (url.pathname === "/watchlist") {
-        if (request.method === "GET")
-          return json({ ok: true, watchlist: await getWatchlist(env) });
+        if (request.method === "GET") return json({ ok: true, watchlist: await getWatchlist(env) });
         if (request.method === "POST") {
           const body = await request.json();
           await setWatchlist(env, body.watchlist || []);
@@ -779,7 +695,6 @@ export default {
         return json({ ok: true, items: await getAlerts(env) });
       }
 
-      // Manual / GitHub Actions trigger
       if (url.pathname === "/monitor") {
         const res = await monitorFeeds(env);
         return json(res);
