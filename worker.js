@@ -1,6 +1,6 @@
 /*
  * BSE RSS READER
- * V5.5 - Day-Store Accumulator
+ * V5.6 - Bucketed Day Store (CPU fix)
  *   - Monitor merges JSON API, RSS, and Financial Results, deduped by
  *     a cross-source fingerprint (attachment filename, or
  *     scrip+title+day as fallback) - not by each source's own id,
@@ -8,11 +8,15 @@
  *   - Whichever source fetches an announcement first is what triggers
  *     Telegram/ntfy; a slower source catching up later never fires a
  *     duplicate alert.
- *   - The app's announcement list is no longer a live full-day fetch
- *     (thousands of rows isn't realistic in one request). Instead the
- *     cron appends newly-seen items to a per-day KV store as it runs,
- *     and the frontend just reads that running total. Auto-expires
- *     48h after the last write.
+ *   - Today's announcement list is stored in 15-minute KV buckets
+ *     rather than one growing blob rewritten every cron tick - a
+ *     full-day blob re-parsed/re-serialized every minute was hitting
+ *     the Workers free plan's 10ms CPU limit ("exceededCpu") by
+ *     mid-afternoon. Each tick now only touches its own small bucket;
+ *     the full list is assembled on demand when the app reads it.
+ *     Auto-expires 48h after last write.
+ *   - Monitor tick fetches only 1 JSON page (not 3) to keep per-tick
+ *     parsing CPU minimal.
  *   - Fixed IST timezone
  *
  * KV binding: BSE_DATA
@@ -523,14 +527,24 @@ async function saveAlertFingerprints(env, list) {
    DAY STORE - accumulates today's announcements as the cron runs
    Live-fetching thousands of rows from BSE on every page load isn't
    realistic (Workers subrequest limits, BSE rate limits). Instead,
-   every monitor tick appends whatever's genuinely new to a
-   per-day KV entry, so the running total is built up over the course
-   of the day. The frontend just reads this store - fast, and no
-   pagination needed. Auto-expires 48h after the last write.
+   every monitor tick appends whatever's genuinely new to KV, and the
+   frontend reads the running total. Auto-expires 48h after write.
+
+   Stored as 15-minute time buckets (ann:<day>:<HHMM>), NOT one giant
+   growing list. A single blob rewritten in full on every 1-minute
+   tick was re-parsing/re-serializing an ever-larger array every
+   single time - by mid-afternoon that alone was enough synchronous
+   work to exceed the Workers free plan's 10ms CPU-per-invocation
+   limit (confirmed via "outcome": "exceededCpu" in Observability).
+   Bucketing means each cron tick only ever touches a handful of
+   items (its own current 15-minute window) - flat, cheap, all day.
+   The full day's list is only assembled on demand, when the app
+   actually asks for it.
    ============================================================ */
 
 const DAY_STORE_TTL_SECONDS = 172800; // 48 hours
-const MAX_DAY_STORE_ITEMS = 25000; // safety cap only - well above a 20k/day volume
+const DAY_STORE_BUCKET_MINUTES = 15;
+const MAX_DAY_STORE_ITEMS = 25000; // safety cap on the assembled read - well above a 20k/day volume
 
 function getIstDateStr(d = new Date()) {
   const istOffset = 5.5 * 60 * 60 * 1000;
@@ -541,26 +555,64 @@ function getIstDateStr(d = new Date()) {
   return `${yyyy}${mm}${dd}`;
 }
 
-function dayStoreKey(dayStr) {
-  return `announcements:${dayStr}`;
+function getBucketKey(dayStr, d = new Date()) {
+  const istOffset = 5.5 * 60 * 60 * 1000;
+  const ist = new Date(d.getTime() + istOffset);
+  const hh = String(ist.getUTCHours()).padStart(2, "0");
+  const bucketMin = Math.floor(ist.getUTCMinutes() / DAY_STORE_BUCKET_MINUTES) * DAY_STORE_BUCKET_MINUTES;
+  const mm = String(bucketMin).padStart(2, "0");
+  return `ann:${dayStr}:${hh}${mm}`;
 }
 
-async function getDayStore(env, dayStr) {
-  if (!env.BSE_DATA) return [];
-  const data = await env.BSE_DATA.get(dayStoreKey(dayStr), "json");
-  return Array.isArray(data) ? data : [];
-}
-
+// WRITE PATH - called every cron tick. Only ever reads/rewrites the
+// CURRENT 15-minute bucket, never the whole day - stays cheap no
+// matter how large the day's total gets.
 async function appendToDayStore(env, dayStr, newItems) {
   if (!env.BSE_DATA || !newItems || !newItems.length) return;
-  const existing = await getDayStore(env, dayStr);
-  const existingFps = new Set(existing.map((i) => i.fingerprint));
+  const bucketKey = getBucketKey(dayStr);
+  const existing = await env.BSE_DATA.get(bucketKey, "json");
+  const bucket = Array.isArray(existing) ? existing : [];
+  const existingFps = new Set(bucket.map((i) => i.fingerprint));
   const additions = newItems.filter((i) => i.fingerprint && !existingFps.has(i.fingerprint));
   if (!additions.length) return;
-  const merged = additions.concat(existing).slice(0, MAX_DAY_STORE_ITEMS);
-  await env.BSE_DATA.put(dayStoreKey(dayStr), JSON.stringify(merged), {
+  const merged = additions.concat(bucket);
+  await env.BSE_DATA.put(bucketKey, JSON.stringify(merged), {
     expirationTtl: DAY_STORE_TTL_SECONDS,
   });
+}
+
+// READ PATH - called when the app asks for the list. Lists all of
+// today's bucket keys and merges them. Heavier than a single get,
+// but only runs when actually requested, not every cron minute.
+async function getDayStore(env, dayStr) {
+  if (!env.BSE_DATA) return [];
+  const prefix = `ann:${dayStr}:`;
+  const keys = [];
+  let cursor;
+  do {
+    const listResult = await env.BSE_DATA.list({ prefix, cursor });
+    keys.push(...listResult.keys.map((k) => k.name));
+    cursor = listResult.list_complete ? undefined : listResult.cursor;
+  } while (cursor);
+
+  if (!keys.length) return [];
+
+  const buckets = await Promise.all(keys.map((k) => env.BSE_DATA.get(k, "json")));
+
+  const merged = [];
+  const seenFps = new Set();
+  for (const bucket of buckets) {
+    if (!Array.isArray(bucket)) continue;
+    for (const item of bucket) {
+      if (item.fingerprint && !seenFps.has(item.fingerprint)) {
+        seenFps.add(item.fingerprint);
+        merged.push(item);
+      }
+    }
+  }
+
+  merged.sort((a, b) => new Date(b.fetchedAt) - new Date(a.fetchedAt));
+  return merged.slice(0, MAX_DAY_STORE_ITEMS);
 }
 
 async function getTimestampMap(env) {
@@ -724,11 +776,12 @@ async function fetchAllSources(env, jsonMaxPages = 1) {
    ============================================================ */
 
 async function monitorFeeds(env) {
-  // Shallow on purpose: this runs every ~1 minute during market hours, so
-  // it only needs the newest few pages to catch brand-new announcements
-  // (fingerprint dedup means it's fine if a slower-changing page 1 misses
-  // something - the deeper /bse-announcements fetch will pick it up).
-  const { items, sources } = await fetchAllSources(env, 3);
+  // As shallow as possible on purpose: this runs every ~1 minute during
+  // market hours, so it only needs page 1 (newest items) to catch what's
+  // arrived since the last tick - fingerprint dedup means a slower-moving
+  // page 1 catching up next tick is fine. Every extra page here is extra
+  // parsing CPU spent on every single tick, all day.
+  const { items, sources } = await fetchAllSources(env, 1);
 
   const watchlist = await getWatchlist(env);
   const settings = await getNotificationSettings(env);
