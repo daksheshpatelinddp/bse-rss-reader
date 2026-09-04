@@ -1,23 +1,16 @@
 /*
  * BSE RSS READER
- * V5.6 - Bucketed Day Store (CPU fix)
- *   - Monitor merges JSON API, RSS, and Financial Results, deduped by
- *     a cross-source fingerprint (attachment filename, or
- *     scrip+title+day as fallback) - not by each source's own id,
- *     since JSON and RSS use different ids for the same announcement.
- *   - Whichever source fetches an announcement first is what triggers
- *     Telegram/ntfy; a slower source catching up later never fires a
- *     duplicate alert.
- *   - Today's announcement list is stored in 15-minute KV buckets
- *     rather than one growing blob rewritten every cron tick - a
- *     full-day blob re-parsed/re-serialized every minute was hitting
- *     the Workers free plan's 10ms CPU limit ("exceededCpu") by
- *     mid-afternoon. Each tick now only touches its own small bucket;
- *     the full list is assembled on demand when the app reads it.
- *     Auto-expires 48h after last write.
- *   - Monitor tick fetches only 1 JSON page (not 3) to keep per-tick
- *     parsing CPU minimal.
- *   - Fixed IST timezone
+ * V5.7 - Fast path (CPU-safe)
+ *   Goal: detect new announcements as fast as possible on free plan.
+ *   - 1-minute cron uses ONLY BSE JSON API page 1 (cheapest + newest).
+ *   - XML/RSS + Financial Results are used only on deeper refresh
+ *     (/bse-announcements seed or explicit full=1), not every tick.
+ *   - No giant "seen" rewrite every minute. Recent fingerprints live
+ *     in a small rolling set (MAX_RECENT_SEEN). Day-store buckets still
+ *     accumulate the full day for the app UI.
+ *   - Timestamp map only touched for genuinely new items.
+ *   - Cross-source fingerprint still prevents duplicate Telegram/ntfy.
+ *   - Auto-expires day buckets 48h after last write.
  *
  * KV binding: BSE_DATA
  * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
@@ -32,8 +25,11 @@ const BSE_ANN_API =
 const CORPORATE_ANNOUNCEMENTS_URL =
   "https://beta.bseindia.com/data/xml/announcements.xml";
 
-const MAX_SEEN = 10000;
+const MAX_RECENT_SEEN = 2500; // small enough to stay under 10ms CPU
 const MAX_ALERTS = 1000;
+const MAX_DAY_STORE_ITEMS = 25000;
+const DAY_STORE_TTL_SECONDS = 172800; // 48 hours
+const DAY_STORE_BUCKET_MINUTES = 15;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -46,7 +42,7 @@ const CORS_HEADERS = {
    ============================================================ */
 
 function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
+  return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
@@ -90,9 +86,12 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   }
 
   var pdfLink = normalizeBseLink(link);
-  var targetLink = (pdfLink && pdfLink !== "https://www.bseindia.com")
-    ? pdfLink
-    : (scrip ? "https://www.bseindia.com/stock-share-price/" + scrip : "https://www.bseindia.com");
+  var targetLink =
+    pdfLink && pdfLink !== "https://www.bseindia.com"
+      ? pdfLink
+      : scrip
+        ? "https://www.bseindia.com/stock-share-price/" + scrip
+        : "https://www.bseindia.com";
 
   const cleanTitle = escapeTelegramHtml(title);
   const cleanBody = escapeTelegramHtml(body);
@@ -100,7 +99,7 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
     ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
     : "N/A";
 
-  const messageText = ` <b>${cleanTitle}</b>\n\n${cleanBody}\n\n <b>Fetched:</b> ${formattedFetchTime}\n <a href="${targetLink}">View Attachment / Details</a>`;
+  const messageText = `🔔 <b>${cleanTitle}</b>\n\n${cleanBody}\n\n⏱ <b>Fetched:</b> ${formattedFetchTime}\n📎 <a href="${targetLink}">View Attachment / Details</a>`;
 
   try {
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -126,9 +125,12 @@ async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
   }
 
   var pdfLink = normalizeBseLink(link);
-  var targetLink = (pdfLink && pdfLink !== "https://www.bseindia.com")
-    ? pdfLink
-    : (scrip ? "https://www.bseindia.com/stock-share-price/" + scrip : "https://www.bseindia.com");
+  var targetLink =
+    pdfLink && pdfLink !== "https://www.bseindia.com"
+      ? pdfLink
+      : scrip
+        ? "https://www.bseindia.com/stock-share-price/" + scrip
+        : "https://www.bseindia.com";
 
   const formattedFetchTime = fetchedAt
     ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
@@ -179,7 +181,7 @@ async function fetchXML(url) {
   const response = await fetch(url, {
     method: "GET",
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.3)",
+      "User-Agent": "Mozilla/5.0 (compatible; BSE-RSS-Reader/5.7)",
       Accept: "application/rss+xml, application/xml, text/xml, */*",
       "Cache-Control": "no-cache",
     },
@@ -221,11 +223,6 @@ async function fetchBseAnnouncementsJsonPage(pageNo, dateStr) {
   return { rows, totalCount };
 }
 
-// BSE's JSON API is paginated - Table1[0].ROWCNT tells us the true total
-// for the day, which can be 1000s of rows across 50+ pages. maxPages caps
-// how deep we page in a single call, so a fast cron tick (cheap, few
-// pages) and an on-demand full refresh (deeper) can ask for different
-// amounts of coverage.
 async function fetchBseAnnouncementsJson(maxPages = 1) {
   const today = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000;
@@ -259,23 +256,44 @@ const CATEGORY_RULES = [
   {
     name: "Financial Results",
     words: [
-      "financial results", "financial result", "unaudited financial results",
-      "audited financial results", "quarterly results", "quarterly result",
-      "results for the quarter", "standalone financial results", "consolidated financial results",
+      "financial results",
+      "financial result",
+      "unaudited financial results",
+      "audited financial results",
+      "quarterly results",
+      "quarterly result",
+      "results for the quarter",
+      "standalone financial results",
+      "consolidated financial results",
     ],
   },
   { name: "Board Meeting", words: ["board meeting", "meeting of the board", "outcome of board meeting"] },
   { name: "Dividend", words: ["dividend", "interim dividend", "final dividend", "special dividend"] },
   { name: "Bonus", words: ["bonus issue", "bonus shares", "issue of bonus shares"] },
-  { name: "Fund Raising", words: ["fund raising", "fundraising", "qip", "private placement", "preferential issue"] },
+  {
+    name: "Fund Raising",
+    words: ["fund raising", "fundraising", "qip", "private placement", "preferential issue"],
+  },
   { name: "Acquisition", words: ["acquisition", "acquire", "acquired", "takeover"] },
-  { name: "Order / Contract", words: ["order received", "order win", "work order", "contract awarded", "award of order", "receipt of order"] },
-  { name: "Credit Rating", words: ["credit rating", "rating reaffirmed", "rating upgrade", "rating downgrade"] },
-  { name: "Appointment / Resignation", words: ["appointment", "resignation", "cessation", "change in management"] },
+  {
+    name: "Order / Contract",
+    words: ["order received", "order win", "work order", "contract awarded", "award of order", "receipt of order"],
+  },
+  {
+    name: "Credit Rating",
+    words: ["credit rating", "rating reaffirmed", "rating upgrade", "rating downgrade"],
+  },
+  {
+    name: "Appointment / Resignation",
+    words: ["appointment", "resignation", "cessation", "change in management"],
+  },
 ];
 
 function classifyAnnouncement(title, description, categoryName) {
-  const text = `${title || ""} ${description || ""} ${categoryName || ""}`.toLowerCase().replace(/\s+/g, " ").trim();
+  const text = `${title || ""} ${description || ""} ${categoryName || ""}`
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
   const categories = [];
 
   for (const rule of CATEGORY_RULES) {
@@ -359,7 +377,6 @@ function parseBseJsonAnnouncements(table, fetchedAt) {
     const subCat = String(row.SUBCATNAME || "").trim();
     const description = [headline, subCat, categoryName].filter(Boolean).join(" | ");
 
-    // Fixed IST
     let pubDate = row.DissemDT || row.News_submission_dt || row.NEWS_DT || row.DT_TM;
     if (pubDate) {
       if (!pubDate.includes("Z") && !pubDate.includes("+") && !pubDate.includes("-", 10)) {
@@ -458,7 +475,7 @@ function parseCorporateAnnouncements(xml, fetchedAt) {
 }
 
 /* ============================================================
-   KV
+   KV - watchlist / settings / alerts
    ============================================================ */
 
 async function getWatchlist(env) {
@@ -483,17 +500,6 @@ async function setNotificationSettings(env, settings) {
   await env.BSE_DATA.put("notificationSettings", JSON.stringify(settings));
 }
 
-async function getSeen(env) {
-  if (!env.BSE_DATA) return [];
-  const data = await env.BSE_DATA.get("announcementSeen", "json");
-  return Array.isArray(data) ? data : [];
-}
-
-async function saveSeen(env, ids) {
-  if (!env.BSE_DATA) return;
-  await env.BSE_DATA.put("announcementSeen", JSON.stringify(ids.slice(0, MAX_SEEN)));
-}
-
 async function getAlerts(env) {
   if (!env.BSE_DATA) return [];
   const data = await env.BSE_DATA.get("specialAlerts", "json");
@@ -509,9 +515,6 @@ async function getAlertFingerprints(env) {
   if (!env.BSE_DATA) return [];
   const data = await env.BSE_DATA.get("alertFingerprints", "json");
   if (Array.isArray(data)) return data;
-  // First run after this update: seed from already-sent alerts so we
-  // don't re-fire Telegram/ntfy for things already alerted under the
-  // old id-only scheme.
   const alerts = await getAlerts(env);
   const seeded = alerts.map((a) => a.fingerprint || computeFingerprint(a)).filter(Boolean);
   await env.BSE_DATA.put("alertFingerprints", JSON.stringify(seeded));
@@ -524,27 +527,23 @@ async function saveAlertFingerprints(env, list) {
 }
 
 /* ============================================================
-   DAY STORE - accumulates today's announcements as the cron runs
-   Live-fetching thousands of rows from BSE on every page load isn't
-   realistic (Workers subrequest limits, BSE rate limits). Instead,
-   every monitor tick appends whatever's genuinely new to KV, and the
-   frontend reads the running total. Auto-expires 48h after write.
-
-   Stored as 15-minute time buckets (ann:<day>:<HHMM>), NOT one giant
-   growing list. A single blob rewritten in full on every 1-minute
-   tick was re-parsing/re-serializing an ever-larger array every
-   single time - by mid-afternoon that alone was enough synchronous
-   work to exceed the Workers free plan's 10ms CPU-per-invocation
-   limit (confirmed via "outcome": "exceededCpu" in Observability).
-   Bucketing means each cron tick only ever touches a handful of
-   items (its own current 15-minute window) - flat, cheap, all day.
-   The full day's list is only assembled on demand, when the app
-   actually asks for it.
+   RECENT SEEN - small rolling set (CPU-safe)
    ============================================================ */
 
-const DAY_STORE_TTL_SECONDS = 172800; // 48 hours
-const DAY_STORE_BUCKET_MINUTES = 15;
-const MAX_DAY_STORE_ITEMS = 25000; // safety cap on the assembled read - well above a 20k/day volume
+async function getRecentSeen(env) {
+  if (!env.BSE_DATA) return [];
+  const data = await env.BSE_DATA.get("recentSeen", "json");
+  return Array.isArray(data) ? data : [];
+}
+
+async function saveRecentSeen(env, ids) {
+  if (!env.BSE_DATA) return;
+  await env.BSE_DATA.put("recentSeen", JSON.stringify(ids.slice(0, MAX_RECENT_SEEN)));
+}
+
+/* ============================================================
+   DAY STORE - 15-minute buckets
+   ============================================================ */
 
 function getIstDateStr(d = new Date()) {
   const istOffset = 5.5 * 60 * 60 * 1000;
@@ -564,15 +563,12 @@ function getBucketKey(dayStr, d = new Date()) {
   return `ann:${dayStr}:${hh}${mm}`;
 }
 
-// WRITE PATH - called every cron tick. Only ever reads/rewrites the
-// CURRENT 15-minute bucket, never the whole day - stays cheap no
-// matter how large the day's total gets.
 async function appendToDayStore(env, dayStr, newItems) {
   if (!env.BSE_DATA || !newItems || !newItems.length) return;
   const bucketKey = getBucketKey(dayStr);
   const existing = await env.BSE_DATA.get(bucketKey, "json");
   const bucket = Array.isArray(existing) ? existing : [];
-  const existingFps = new Set(bucket.map((i) => i.fingerprint));
+  const existingFps = new Set(bucket.map((i) => i.fingerprint).filter(Boolean));
   const additions = newItems.filter((i) => i.fingerprint && !existingFps.has(i.fingerprint));
   if (!additions.length) return;
   const merged = additions.concat(bucket);
@@ -581,9 +577,6 @@ async function appendToDayStore(env, dayStr, newItems) {
   });
 }
 
-// READ PATH - called when the app asks for the list. Lists all of
-// today's bucket keys and merges them. Heavier than a single get,
-// but only runs when actually requested, not every cron minute.
 async function getDayStore(env, dayStr) {
   if (!env.BSE_DATA) return [];
   const prefix = `ann:${dayStr}:`;
@@ -615,52 +608,8 @@ async function getDayStore(env, dayStr) {
   return merged.slice(0, MAX_DAY_STORE_ITEMS);
 }
 
-async function getTimestampMap(env) {
-  if (!env.BSE_DATA) return {};
-  const data = await env.BSE_DATA.get("announcementTimestamps", "json");
-  return data || {};
-}
-
-async function saveTimestampMap(env, map) {
-  if (!env.BSE_DATA) return;
-  const keys = Object.keys(map);
-  if (keys.length > 5000) {
-    const trimmedMap = {};
-    keys.slice(keys.length - 5000).forEach((k) => {
-      trimmedMap[k] = map[k];
-    });
-    await env.BSE_DATA.put("announcementTimestamps", JSON.stringify(trimmedMap));
-  } else {
-    await env.BSE_DATA.put("announcementTimestamps", JSON.stringify(map));
-  }
-}
-
-async function attachPersistentTimestamps(items, env) {
-  const map = await getTimestampMap(env);
-  const now = new Date().toISOString();
-  let updated = false;
-
-  const results = items.map((item) => {
-    if (map[item.id]) {
-      return { ...item, fetchedAt: map[item.id] };
-    } else {
-      map[item.id] = now;
-      updated = true;
-      return { ...item, fetchedAt: now };
-    }
-  });
-
-  if (updated) await saveTimestampMap(env, map);
-  return results;
-}
-
 /* ============================================================
    CROSS-SOURCE FINGERPRINT
-   The JSON API and the XML/RSS feeds assign different IDs to the
-   SAME announcement, and publish/fetch it at slightly different
-   times. This fingerprint lets us recognize "same announcement"
-   across sources so we only ever alert on it once - whichever
-   source fetches it first wins.
    ============================================================ */
 
 function extractAttachmentName(link) {
@@ -670,18 +619,15 @@ function extractAttachmentName(link) {
 }
 
 function computeFingerprint(item) {
-  // The BSE attachment PDF filename is the most reliable cross-source
-  // key: both the JSON row (ATTACHMENTNAME) and the RSS <link> point
-  // to the same file for the same announcement.
   const attachment =
     String(item.attachment || "").trim().toLowerCase() || extractAttachmentName(item.link);
   if (attachment) return `att:${attachment}`;
 
-  // Fallback for items with no attachment: scrip + normalized title +
-  // day. Day-level (not minute-level) so differing publish/fetch
-  // clocks between sources don't split one announcement into two.
   const scrip = String(item.scrip || "").trim();
-  const title = String(item.title || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const title = String(item.title || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
   const day = String(item.pubDate || "").slice(0, 10);
   return `st:${scrip}|${title}|${day}`;
 }
@@ -718,11 +664,39 @@ function matchesWatchlist(item, watchlist) {
 }
 
 /* ============================================================
-   FETCH + MERGE ALL SOURCES
-   Used by both /monitor and /bse-announcements so the app's own
-   list and the alerts are always built from the same "whichever
-   source got it first" merged data.
+   FETCH SOURCES
+   - fast path (default): JSON page 1 only  →  used by 1-min cron
+   - full path: JSON + RSS + Financial Results  →  seed / deep refresh
    ============================================================ */
+
+async function fetchFastSources(env) {
+  const fetchedAt = new Date().toISOString();
+  let jsonItems = [];
+
+  try {
+    const table = await fetchBseAnnouncementsJson(1);
+    jsonItems = parseBseJsonAnnouncements(table, fetchedAt);
+  } catch (err) {
+    console.error("JSON fetch failed:", err);
+  }
+
+  const merged = new Map();
+  for (const item of jsonItems) {
+    const fp = computeFingerprint(item);
+    item.fingerprint = fp;
+    if (fp && !merged.has(fp)) merged.set(fp, item);
+  }
+
+  const items = Array.from(merged.values());
+  // No persistent timestamp map on the hot path – use this tick's time.
+  // First-seen order is preserved by the day-store + recentSeen.
+  items.sort((a, b) => new Date(b.fetchedAt) - new Date(a.fetchedAt));
+
+  return {
+    items,
+    sources: { json: jsonItems.length, rss: 0, financial: 0 },
+  };
+}
 
 async function fetchAllSources(env, jsonMaxPages = 1) {
   const fetchedAt = new Date().toISOString();
@@ -732,33 +706,23 @@ async function fetchAllSources(env, jsonMaxPages = 1) {
   let finItems = [];
 
   const [jsonResult, rssResult, finResult] = await Promise.allSettled([
-    fetchBseAnnouncementsJson(jsonMaxPages).then(table => parseBseJsonAnnouncements(table, fetchedAt)),
-    fetchXML(CORPORATE_ANNOUNCEMENTS_URL).then(xml => parseCorporateAnnouncements(xml, fetchedAt)),
-    fetchXML(FINANCIAL_RESULTS_URL).then(xml => parseFinancialResults(xml, fetchedAt)),
+    fetchBseAnnouncementsJson(jsonMaxPages).then((table) => parseBseJsonAnnouncements(table, fetchedAt)),
+    fetchXML(CORPORATE_ANNOUNCEMENTS_URL).then((xml) => parseCorporateAnnouncements(xml, fetchedAt)),
+    fetchXML(FINANCIAL_RESULTS_URL).then((xml) => parseFinancialResults(xml, fetchedAt)),
   ]);
 
   if (jsonResult.status === "fulfilled") jsonItems = jsonResult.value;
   if (rssResult.status === "fulfilled") rssItems = rssResult.value;
   if (finResult.status === "fulfilled") finItems = finResult.value;
 
-  // Merge across sources by fingerprint, NOT by raw id - the JSON and
-  // RSS ids for the same announcement don't match. JSON is checked
-  // first in this list, so when both sources already have an item in
-  // the same tick, we keep the JSON copy (it tends to land first).
   const merged = new Map();
   [...jsonItems, ...rssItems, ...finItems].forEach((item) => {
     const fp = computeFingerprint(item);
     item.fingerprint = fp;
-    if (fp && !merged.has(fp)) {
-      merged.set(fp, item);
-    }
+    if (fp && !merged.has(fp)) merged.set(fp, item);
   });
 
-  const rawItems = Array.from(merged.values());
-  // fetchedAt here is persisted per-item (first time OUR worker ever
-  // saw it) - sort by that so "first fetched" also determines display
-  // order, not just alert order.
-  const items = await attachPersistentTimestamps(rawItems, env);
+  const items = Array.from(merged.values());
   items.sort((a, b) => new Date(b.fetchedAt) - new Date(a.fetchedAt));
 
   return {
@@ -772,84 +736,120 @@ async function fetchAllSources(env, jsonMaxPages = 1) {
 }
 
 /* ============================================================
-   MONITOR - CHECKS ALL SOURCES, ALERTS ONCE PER ANNOUNCEMENT
+   MONITOR - FAST PATH (runs every ~1 min)
    ============================================================ */
 
-async function monitorFeeds(env) {
-  // As shallow as possible on purpose: this runs every ~1 minute during
-  // market hours, so it only needs page 1 (newest items) to catch what's
-  // arrived since the last tick - fingerprint dedup means a slower-moving
-  // page 1 catching up next tick is fine. Every extra page here is extra
-  // parsing CPU spent on every single tick, all day.
-  const { items, sources } = await fetchAllSources(env, 1);
+async function monitorFeeds(env, options = {}) {
+  const useFull = options.full === true;
+
+  // Fast path = JSON page 1 only (stays under free-plan 10ms CPU).
+  // Full path = JSON + both XML feeds (used by seed / rare deep refresh).
+  const { items, sources } = useFull
+    ? await fetchAllSources(env, options.jsonMaxPages || 1)
+    : await fetchFastSources(env);
 
   const watchlist = await getWatchlist(env);
   const settings = await getNotificationSettings(env);
-  const seen = await getSeen(env);
-  const alerts = await getAlerts(env);
-  const alertFpSet = new Set(await getAlertFingerprints(env));
+  const recentSeen = await getRecentSeen(env);
+  const seenSet = new Set(recentSeen);
 
-  if (seen.length === 0) {
+  // First run of the day / empty baseline
+  if (recentSeen.length === 0) {
     const fps = items.map((item) => item.fingerprint).filter(Boolean);
-    await saveSeen(env, fps);
+    await saveRecentSeen(env, fps);
     await appendToDayStore(env, getIstDateStr(), items);
-    return { status: "initialized baseline", count: items.length, items };
+    return {
+      ok: true,
+      status: "initialized baseline",
+      newAnnouncements: 0,
+      newAlerts: 0,
+      sources,
+      totalSeen: fps.length,
+    };
   }
 
-  const seenSet = new Set(seen);
   const newItems = items.filter((item) => item.fingerprint && !seenSet.has(item.fingerprint));
-  await appendToDayStore(env, getIstDateStr(), newItems);
-  let newAlertCount = 0;
 
-  for (const item of newItems) {
-    if (matchesWatchlist(item, watchlist)) {
-      // Fingerprint (not source-specific id) gates the alert, so if the
-      // slower source catches up later with the same announcement under
-      // a different id, it won't fire a duplicate Telegram/ntfy alert.
-      if (!alertFpSet.has(item.fingerprint)) {
-        if (settings.telegram !== false) {
-          await sendTelegramAlert(
-            `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
-            item.title || "New Announcement",
-            item.scrip,
-            item.link,
-            item.fetchedAt,
-            env
-          );
-        }
-        if (settings.ntfy !== false) {
-          await sendNtfyAlert(
-            `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
-            item.title || "New Announcement",
-            item.scrip,
-            item.link,
-            item.fetchedAt,
-            env
-          );
-        }
-        alerts.unshift({
-          ...item,
-          alert: true,
-          alertCreatedAt: new Date().toISOString(),
-        });
-        alertFpSet.add(item.fingerprint);
-        newAlertCount++;
+  // Nothing new → exit immediately (cheapest possible tick)
+  if (newItems.length === 0) {
+    return {
+      ok: true,
+      newAnnouncements: 0,
+      newAlerts: 0,
+      sources,
+      totalSeen: recentSeen.length,
+    };
+  }
+
+  await appendToDayStore(env, getIstDateStr(), newItems);
+
+  let newAlertCount = 0;
+  let alerts = null;
+  let alertFpSet = null;
+
+  // Only load alerts / fingerprints when we might actually fire one
+  const maybeMatch = watchlist.length > 0;
+  if (maybeMatch) {
+    for (const item of newItems) {
+      if (!matchesWatchlist(item, watchlist)) continue;
+
+      if (!alertFpSet) {
+        alertFpSet = new Set(await getAlertFingerprints(env));
+        alerts = await getAlerts(env);
       }
+
+      if (alertFpSet.has(item.fingerprint)) continue;
+
+      if (settings.telegram !== false) {
+        await sendTelegramAlert(
+          `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
+          item.title || "New Announcement",
+          item.scrip,
+          item.link,
+          item.fetchedAt,
+          env
+        );
+      }
+      if (settings.ntfy !== false) {
+        await sendNtfyAlert(
+          `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
+          item.title || "New Announcement",
+          item.scrip,
+          item.link,
+          item.fetchedAt,
+          env
+        );
+      }
+
+      alerts.unshift({
+        ...item,
+        alert: true,
+        alertCreatedAt: new Date().toISOString(),
+      });
+      alertFpSet.add(item.fingerprint);
+      newAlertCount++;
     }
   }
 
-  const updatedSeen = Array.from(new Set([...newItems.map((i) => i.fingerprint), ...seen])).slice(0, MAX_SEEN);
-  await saveSeen(env, updatedSeen);
-  await saveAlerts(env, alerts);
-  await saveAlertFingerprints(env, Array.from(alertFpSet));
+  // Update recent-seen: newest first, capped
+  const updatedSeen = [
+    ...newItems.map((i) => i.fingerprint).filter(Boolean),
+    ...recentSeen,
+  ];
+  const uniqueSeen = Array.from(new Set(updatedSeen)).slice(0, MAX_RECENT_SEEN);
+  await saveRecentSeen(env, uniqueSeen);
+
+  if (newAlertCount > 0 && alerts && alertFpSet) {
+    await saveAlerts(env, alerts);
+    await saveAlertFingerprints(env, Array.from(alertFpSet));
+  }
 
   return {
     ok: true,
     newAnnouncements: newItems.length,
     newAlerts: newAlertCount,
     sources,
-    totalSeen: updatedSeen.length,
-    items,
+    totalSeen: uniqueSeen.length,
   };
 }
 
@@ -867,22 +867,25 @@ export default {
         return json({
           status: "running",
           app: "BSE RSS Reader",
-          version: "5.3",
-          note: "Monitor checks both JSON + RSS. Frontend uses RSS list.",
+          version: "5.7",
+          note: "Fast path: JSON page-1 every minute. XML only on deep seed.",
         });
       }
 
-      // Frontend list: today's accumulated store (built up by the cron
-      // as it runs, not a live full-day fetch - that many rows isn't
-      // realistic in one request). If the store is empty (first hit
-      // today, or it just expired), seed it once with a deep fetch.
+      // Frontend list: today's accumulated store.
+      // If empty, seed once with a deeper multi-source fetch.
       if (url.pathname === "/bse-announcements") {
         const dayStr = getIstDateStr();
         let items = await getDayStore(env, dayStr);
         if (items.length === 0) {
-          const seedResult = await fetchAllSources(env, 40);
+          const seedResult = await fetchAllSources(env, 20);
           if (seedResult.items.length) {
             await appendToDayStore(env, dayStr, seedResult.items);
+            // Also seed recentSeen so the next cron tick doesn't re-alert everything
+            const fps = seedResult.items.map((i) => i.fingerprint).filter(Boolean);
+            const existing = await getRecentSeen(env);
+            const merged = Array.from(new Set([...fps, ...existing])).slice(0, MAX_RECENT_SEEN);
+            await saveRecentSeen(env, merged);
             items = await getDayStore(env, dayStr);
           }
         }
@@ -893,7 +896,7 @@ export default {
         const dayStr = getIstDateStr();
         const items = await getDayStore(env, dayStr);
         const map = new Map();
-        items.forEach((i) => i.categories.forEach((c) => map.set(c, (map.get(c) || 0) + 1)));
+        items.forEach((i) => (i.categories || []).forEach((c) => map.set(c, (map.get(c) || 0) + 1)));
         const categories = Array.from(map.entries()).map(([name, count]) => ({ name, count }));
         return json({ ok: true, categories });
       }
@@ -922,8 +925,11 @@ export default {
         return json({ ok: true, items: await getAlerts(env) });
       }
 
+      // /monitor  → fast path (JSON only)
+      // /monitor?full=1  → includes XML feeds (heavier, use sparingly)
       if (url.pathname === "/monitor") {
-        const res = await monitorFeeds(env);
+        const full = url.searchParams.get("full") === "1";
+        const res = await monitorFeeds(env, { full });
         return json(res);
       }
 
@@ -934,6 +940,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(monitorFeeds(env));
+    // Always use the cheap fast path on cron so we stay under 10ms CPU
+    ctx.waitUntil(monitorFeeds(env, { full: false }));
   },
 };
