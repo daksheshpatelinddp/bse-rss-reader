@@ -1,10 +1,15 @@
 /*
  * BSE RSS READER
- * V5.3 - Hybrid + Dual Source Alerts
- *   • Monitor checks BOTH JSON API and RSS
- *   • Whichever finds new item first  sends Telegram/ntfy
- *   • Frontend still uses large RSS list
- *   • Fixed IST timezone
+ * V5.4 - Cross-Source Fingerprint Dedup
+ *   - Monitor + frontend list both merge JSON API, RSS, and Financial
+ *     Results, deduped by a cross-source fingerprint (attachment
+ *     filename, or scrip+title+day as fallback) - not by each
+ *     source own id, since JSON and RSS use different ids for the
+ *     same announcement.
+ *   - Whichever source fetches an announcement first is what shows in
+ *     the app and triggers Telegram/ntfy; the slower source catching
+ *     up later never fires a duplicate alert.
+ *   - Fixed IST timezone
  *
  * KV binding: BSE_DATA
  * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
@@ -466,6 +471,24 @@ async function saveAlerts(env, alerts) {
   await env.BSE_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
+async function getAlertFingerprints(env) {
+  if (!env.BSE_DATA) return [];
+  const data = await env.BSE_DATA.get("alertFingerprints", "json");
+  if (Array.isArray(data)) return data;
+  // First run after this update: seed from already-sent alerts so we
+  // don't re-fire Telegram/ntfy for things already alerted under the
+  // old id-only scheme.
+  const alerts = await getAlerts(env);
+  const seeded = alerts.map((a) => a.fingerprint || computeFingerprint(a)).filter(Boolean);
+  await env.BSE_DATA.put("alertFingerprints", JSON.stringify(seeded));
+  return seeded;
+}
+
+async function saveAlertFingerprints(env, list) {
+  if (!env.BSE_DATA) return;
+  await env.BSE_DATA.put("alertFingerprints", JSON.stringify(list.slice(0, MAX_ALERTS * 3)));
+}
+
 async function getTimestampMap(env) {
   if (!env.BSE_DATA) return {};
   const data = await env.BSE_DATA.get("announcementTimestamps", "json");
@@ -506,6 +529,38 @@ async function attachPersistentTimestamps(items, env) {
 }
 
 /* ============================================================
+   CROSS-SOURCE FINGERPRINT
+   The JSON API and the XML/RSS feeds assign different IDs to the
+   SAME announcement, and publish/fetch it at slightly different
+   times. This fingerprint lets us recognize "same announcement"
+   across sources so we only ever alert on it once - whichever
+   source fetches it first wins.
+   ============================================================ */
+
+function extractAttachmentName(link) {
+  const s = String(link || "");
+  const m = s.match(/Attach(?:Live|His)\/([^/?#]+)/i);
+  return m ? m[1].toLowerCase() : "";
+}
+
+function computeFingerprint(item) {
+  // The BSE attachment PDF filename is the most reliable cross-source
+  // key: both the JSON row (ATTACHMENTNAME) and the RSS <link> point
+  // to the same file for the same announcement.
+  const attachment =
+    String(item.attachment || "").trim().toLowerCase() || extractAttachmentName(item.link);
+  if (attachment) return `att:${attachment}`;
+
+  // Fallback for items with no attachment: scrip + normalized title +
+  // day. Day-level (not minute-level) so differing publish/fetch
+  // clocks between sources don't split one announcement into two.
+  const scrip = String(item.scrip || "").trim();
+  const title = String(item.title || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const day = String(item.pubDate || "").slice(0, 10);
+  return `st:${scrip}|${title}|${day}`;
+}
+
+/* ============================================================
    MATCHING
    ============================================================ */
 
@@ -537,13 +592,15 @@ function matchesWatchlist(item, watchlist) {
 }
 
 /* ============================================================
-   MONITOR - NOW CHECKS BOTH SOURCES
+   FETCH + MERGE ALL SOURCES
+   Used by both /monitor and /bse-announcements so the app's own
+   list and the alerts are always built from the same "whichever
+   source got it first" merged data.
    ============================================================ */
 
-async function monitorFeeds(env) {
+async function fetchAllSources(env) {
   const fetchedAt = new Date().toISOString();
 
-  // 1. Fetch from BOTH sources in parallel
   let jsonItems = [];
   let rssItems = [];
   let finItems = [];
@@ -558,36 +615,65 @@ async function monitorFeeds(env) {
   if (rssResult.status === "fulfilled") rssItems = rssResult.value;
   if (finResult.status === "fulfilled") finItems = finResult.value;
 
-  // Combine all items (JSON + RSS + Financial)
-  // We use a Map so the same announcement from both sources appears only once
-  const allMap = new Map();
-  [...jsonItems, ...rssItems, ...finItems].forEach(item => {
-    if (item.id && !allMap.has(item.id)) {
-      allMap.set(item.id, item);
+  // Merge across sources by fingerprint, NOT by raw id - the JSON and
+  // RSS ids for the same announcement don't match. JSON is checked
+  // first in this list, so when both sources already have an item in
+  // the same tick, we keep the JSON copy (it tends to land first).
+  const merged = new Map();
+  [...jsonItems, ...rssItems, ...finItems].forEach((item) => {
+    const fp = computeFingerprint(item);
+    item.fingerprint = fp;
+    if (fp && !merged.has(fp)) {
+      merged.set(fp, item);
     }
   });
 
-  const rawItems = Array.from(allMap.values());
+  const rawItems = Array.from(merged.values());
+  // fetchedAt here is persisted per-item (first time OUR worker ever
+  // saw it) - sort by that so "first fetched" also determines display
+  // order, not just alert order.
   const items = await attachPersistentTimestamps(rawItems, env);
+  items.sort((a, b) => new Date(b.fetchedAt) - new Date(a.fetchedAt));
+
+  return {
+    items,
+    sources: {
+      json: jsonItems.length,
+      rss: rssItems.length,
+      financial: finItems.length,
+    },
+  };
+}
+
+/* ============================================================
+   MONITOR - CHECKS ALL SOURCES, ALERTS ONCE PER ANNOUNCEMENT
+   ============================================================ */
+
+async function monitorFeeds(env) {
+  const { items, sources } = await fetchAllSources(env);
 
   const watchlist = await getWatchlist(env);
   const settings = await getNotificationSettings(env);
   const seen = await getSeen(env);
   const alerts = await getAlerts(env);
+  const alertFpSet = new Set(await getAlertFingerprints(env));
 
   if (seen.length === 0) {
-    const ids = items.map((item) => item.id).filter(Boolean);
-    await saveSeen(env, ids);
-    return { status: "initialized baseline", count: items.length };
+    const fps = items.map((item) => item.fingerprint).filter(Boolean);
+    await saveSeen(env, fps);
+    return { status: "initialized baseline", count: items.length, items };
   }
 
   const seenSet = new Set(seen);
-  const newItems = items.filter((item) => item.id && !seenSet.has(item.id));
+  const newItems = items.filter((item) => item.fingerprint && !seenSet.has(item.fingerprint));
   let newAlertCount = 0;
 
   for (const item of newItems) {
     if (matchesWatchlist(item, watchlist)) {
-      if (!alerts.some((a) => a.id === item.id)) {
+      // Fingerprint (not source-specific id) gates the alert, so if the
+      // slower source catches up later with the same announcement under
+      // a different id, it won't fire a duplicate Telegram/ntfy alert.
+      if (!alertFpSet.has(item.fingerprint)) {
         if (settings.telegram !== false) {
           await sendTelegramAlert(
             `${item.company || "Whitelisted Scrip"} (${item.scrip || ""})`,
@@ -613,25 +699,24 @@ async function monitorFeeds(env) {
           alert: true,
           alertCreatedAt: new Date().toISOString(),
         });
+        alertFpSet.add(item.fingerprint);
         newAlertCount++;
       }
     }
   }
 
-  const updatedSeen = Array.from(new Set([...newItems.map((i) => i.id), ...seen])).slice(0, MAX_SEEN);
+  const updatedSeen = Array.from(new Set([...newItems.map((i) => i.fingerprint), ...seen])).slice(0, MAX_SEEN);
   await saveSeen(env, updatedSeen);
   await saveAlerts(env, alerts);
+  await saveAlertFingerprints(env, Array.from(alertFpSet));
 
   return {
     ok: true,
     newAnnouncements: newItems.length,
     newAlerts: newAlertCount,
-    sources: {
-      json: jsonItems.length,
-      rss: rssItems.length,
-      financial: finItems.length,
-    },
+    sources,
     totalSeen: updatedSeen.length,
+    items,
   };
 }
 
@@ -654,20 +739,15 @@ export default {
         });
       }
 
-      // Frontend still uses large RSS list
+      // Frontend list: merged JSON + RSS + Financial, deduped by
+      // fingerprint, sorted by which source fetched it first.
       if (url.pathname === "/bse-announcements") {
-        const fetchedAt = new Date().toISOString();
-        const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-        let items = parseCorporateAnnouncements(xml, fetchedAt);
-        items = await attachPersistentTimestamps(items, env);
-        return json({ ok: true, count: items.length, items, source: "rss" });
+        const { items, sources } = await fetchAllSources(env);
+        return json({ ok: true, count: items.length, items, sources });
       }
 
       if (url.pathname === "/categories") {
-        const fetchedAt = new Date().toISOString();
-        const xml = await fetchXML(CORPORATE_ANNOUNCEMENTS_URL);
-        let items = parseCorporateAnnouncements(xml, fetchedAt);
-        items = await attachPersistentTimestamps(items, env);
+        const { items } = await fetchAllSources(env);
         const map = new Map();
         items.forEach((i) => i.categories.forEach((c) => map.set(c, (map.get(c) || 0) + 1)));
         const categories = Array.from(map.entries()).map(([name, count]) => ({ name, count }));
